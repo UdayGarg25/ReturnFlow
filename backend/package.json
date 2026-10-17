@@ -1,0 +1,44 @@
+{
+  "name": "backend",
+  "version": "1.0.0",
+  "description": "",
+  "main": "src/server.js",
+  "scripts": {
+    "dev": "nodemon src/server.js",
+    "start": "node src/server.js",
+    "test:s3": "node scripts/s3-test.js",
+    "db:schema": "node src/config/setup.js",
+    "db:seed": "node src/config/setup.js --seed",
+    "db:seed-demo": "node src/config/setup.js --demo-only",
+    "db:seed-admin": "node src/config/seedAdmin.js",
+    "db:reset": "node src/config/setup.js --reset --seed",
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "setup:sony-image": "node scripts/setup-sony-image.js",
+    "test:ai": "node scripts/ai-inspection-test.js",
+    "test:ai:live": "node scripts/ai-inspection-live-test.js",
+    "test:ai:scenario": "node scripts/ai-test-scenario-test.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.1146.0",
+    "@openrouter/sdk": "^1.4.25",
+    "bcryptjs": "^3.0.3",
+    "cookie-parser": "^1.4.7",
+    "cors": "^2.8.6",
+    "dotenv": "^18.0.5",
+    "express": "^5.2.1",
+    "jsonwebtoken": "^9.0.3",
+    "mongoose": "^9.10.3",
+    "multer": "^2.4.0",
+    "pg": "^8.23.1",
+    "redis": "^6.3.0",
+    "resend": "^6.32.0",
+    "socket.io": "^4.8.4"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.14"
+  }
+}

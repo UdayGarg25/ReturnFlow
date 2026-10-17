@@ -1,0 +1,33 @@
+# Secrets: real env files are never committed, only the *.example templates
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+.aws/
+credentials
+
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+dist-ssr/
+build/
+coverage/
+.nyc_output/
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+
+# Local scratch / OS / editor
+*.local
+.DS_Store
+Thumbs.db
+.vscode/*
+!.vscode/extensions.json
+.idea/
+*.swp

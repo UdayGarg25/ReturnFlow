@@ -1,0 +1,123 @@
+import { createHash } from 'node:crypto'
+import pool from '../config/db.js'
+import { conflict, notFound, validationError } from '../utils/http.js'
+import { hashPassword } from '../utils/password.js'
+import { loadImage } from './aiInspection.service.js'
+import { createReturn } from './customer.service.js'
+import { updateStatus } from './pickup.service.js'
+import { addImage, checkImageFile, deleteImagesOfReturns } from './returnImage.service.js'
+import { decideReturn } from './seller.service.js'
+
+// DEVELOPMENT-ONLY test scenario for the AI-assisted warehouse inspection.
+//
+// It lets a developer try a REAL two-image comparison in the normal warehouse UI without touching existing business
+// data: it creates its own test customer, order and return, then walks that return through the REAL services
+// (customer request, seller approval, photo upload, pickup accepted and picked up) so the warehouse inspection opens
+// exactly as in production. Everything it creates belongs to ONE test customer, so removing the scenario deletes only
+// those rows. Nothing is mocked and no AI result is invented: the assessment is run afterwards, by the warehouse
+// employee, through the normal "Run AI Assessment" button.
+//
+// Switched on only when AI_TEST_SCENARIO=true AND NODE_ENV is not "production" (app.js does not even mount the
+// routes otherwise).
+export const AI_TEST_ENABLED = process.env.AI_TEST_SCENARIO === 'true' && process.env.NODE_ENV !== 'production'
+
+const TEST_EMAIL = 'ai-test.customer@returnflow.test'
+export const TEST_CUSTOMER_NAME = '[TEST] AI Inspection Customer'
+const sha256 = (bytes) => createHash('sha256').update(bytes).digest('hex')
+
+async function testCustomerId() {
+  return (await pool.query('SELECT id FROM users WHERE email = $1', [TEST_EMAIL])).rows[0]?.id ?? null
+}
+
+// The Sony product that has a reference image in private S3 (same product as the guided demo).
+async function referenceProduct() {
+  const { rows } = await pool.query(
+    `SELECT p.id, p.name, p.price, p.image_key, p.seller_id
+       FROM products p JOIN users s ON s.id = p.seller_id AND s.role = 'SELLER'
+      WHERE p.name = 'Sony WH-1000XM5' AND p.image_key IS NOT NULL ORDER BY p.id LIMIT 1`,
+  )
+  if (!rows[0]) throw notFound('The Sony WH-1000XM5 product with a reference image')
+  return rows[0]
+}
+
+export async function listScenarios() {
+  const customerId = await testCustomerId()
+  if (!customerId) return []
+  const { rows } = await pool.query(
+    `SELECT rr.id AS return_id, rr.status AS return_status, rr.created_at,
+            i.id AS inspection_id, i.status AS inspection_status, a.status AS ai_status,
+            (SELECT COUNT(*)::int FROM return_images WHERE return_request_id = rr.id) AS photos
+       FROM return_requests rr
+       LEFT JOIN inspections i ON i.return_request_id = rr.id
+       LEFT JOIN ai_assessments a ON a.inspection_id = i.id
+      WHERE rr.customer_id = $1 ORDER BY rr.id DESC`,
+    [customerId],
+  )
+  return rows
+}
+
+// `file`: { buffer, size, mimetype } from the upload middleware. Resolves to the new scenario's ids.
+export async function createScenario(file) {
+  checkImageFile(file) // type by signature, size, same rules as a customer upload (400 otherwise)
+  const product = await referenceProduct()
+  const reference = await loadImage(product.image_key)
+  if (sha256(reference.bytes) === sha256(file.buffer)) {
+    throw validationError('That file is identical to the product reference image. Upload a different, real photo of the returned item.', { image: 'Same image as the reference.' })
+  }
+
+  let customerId = await testCustomerId()
+  if (!customerId) {
+    const demoHash = (await pool.query(`SELECT password_hash FROM users WHERE email = 'alice@returnflow.test'`)).rows[0]?.password_hash ?? (await hashPassword(`test-${Date.now()}-${Math.random()}`))
+    customerId = (await pool.query(`INSERT INTO users (name, email, password_hash, role) VALUES ($1, $2, $3, 'CUSTOMER') RETURNING id`, [TEST_CUSTOMER_NAME, TEST_EMAIL, demoHash])).rows[0].id
+  }
+
+  let returnId
+  try {
+    // a delivered order of one Sony headset for the test customer (there is no "place order" API in this app)
+    const orderId = (await pool.query(`INSERT INTO orders (customer_id, status, total_amount) VALUES ($1, 'DELIVERED', $2) RETURNING id`, [customerId, product.price])).rows[0].id
+    const itemId = (await pool.query(`INSERT INTO order_items (order_id, product_id, quantity, unit_price) VALUES ($1, $2, 1, $3) RETURNING id`, [orderId, product.id, product.price])).rows[0].id
+
+    // from here on, the real services, acting as the real roles
+    returnId = (await createReturn(customerId, { orderItemId: itemId, reason: 'DAMAGED', description: '[TEST] Return created by the AI test scenario.' })).id
+    await decideReturn(product.seller_id, returnId, 'approve') // also assigns the pickup
+    await addImage(customerId, returnId, file) // validates and stores the photo privately, key generated by the server
+    const pickup = (await pool.query(`SELECT id, agent_id FROM pickup_assignments WHERE return_request_id = $1`, [returnId])).rows[0]
+    if (!pickup) throw conflict('No pickup agent exists to collect the test return, so no inspection can open.')
+    await updateStatus(pickup.agent_id, pickup.id, 'ACCEPTED')
+    await updateStatus(pickup.agent_id, pickup.id, 'PICKED_UP') // opens the warehouse inspection
+    const inspection = (await pool.query('SELECT id FROM inspections WHERE return_request_id = $1', [returnId])).rows[0]
+    if (!inspection) throw conflict('The inspection did not open (no warehouse staff exist).')
+    return { returnId, inspectionId: inspection.id }
+  } catch (err) {
+    await removeScenarios().catch(() => {}) // never leave a half-built scenario behind
+    throw err
+  }
+}
+
+// Deletes everything that belongs to the test customer (and the test customer) and the test photos in S3. Nothing else.
+export async function removeScenarios() {
+  const customerId = await testCustomerId()
+  if (!customerId) return { removed: 0 }
+  const client = await pool.connect()
+  try {
+    await client.query('BEGIN')
+    const ids = (await client.query('SELECT id FROM return_requests WHERE customer_id = $1', [customerId])).rows.map((r) => r.id)
+    if (ids.length > 0) {
+      await deleteImagesOfReturns(client, ids) // S3 objects first; the rows go with the return (cascade)
+      await client.query('DELETE FROM refunds WHERE return_request_id = ANY($1)', [ids])
+      await client.query('DELETE FROM inspections WHERE return_request_id = ANY($1)', [ids]) // ai_assessments cascade
+      await client.query('DELETE FROM pickup_assignments WHERE return_request_id = ANY($1)', [ids])
+      await client.query('DELETE FROM return_requests WHERE id = ANY($1)', [ids])
+    }
+    await client.query('DELETE FROM order_items WHERE order_id IN (SELECT id FROM orders WHERE customer_id = $1)', [customerId])
+    await client.query('DELETE FROM orders WHERE customer_id = $1', [customerId])
+    await client.query('DELETE FROM users WHERE id = $1', [customerId])
+    await client.query('COMMIT')
+    return { removed: ids.length }
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {})
+    throw err
+  } finally {
+    client.release()
+  }
+}
