@@ -1,6 +1,7 @@
 import express from 'express';
 import cors from 'cors';
 import cookieParser from 'cookie-parser';
+import { getReadinessStatus } from './health/readiness.js';
 import adminRoutes from './routes/admin.routes.js';
 import demoRoutes from './routes/demo.routes.js';
 import devAiTestRoutes from './routes/devAiTest.routes.js';
@@ -34,6 +35,11 @@ app.use(cookieParser()); // fills req.cookies; must come before any route that a
 
 app.get('/health', (req, res) => {
   res.json({ status: 'ok' });
+});
+
+app.get('/health/ready', async (req, res) => {
+  const readiness = await getReadinessStatus();
+  res.status(readiness.httpStatus).json(readiness.body);
 });
 
 // Public: only the auth endpoints. Every other /api router below starts with

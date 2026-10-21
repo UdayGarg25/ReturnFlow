@@ -16,7 +16,8 @@
     "setup:sony-image": "node scripts/setup-sony-image.js",
     "test:ai": "node scripts/ai-inspection-test.js",
     "test:ai:live": "node scripts/ai-inspection-live-test.js",
-    "test:ai:scenario": "node scripts/ai-test-scenario-test.js"
+    "test:ai:scenario": "node scripts/ai-test-scenario-test.js",
+    "test:redis-phase6": "node --test tests/redis-phase6-step1.test.js"
   },
   "keywords": [],
   "author": "",
