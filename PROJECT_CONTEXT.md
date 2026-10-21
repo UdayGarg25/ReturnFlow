@@ -2,6 +2,43 @@
 
 Last verified against the repository: 2026-10-18. The code is the source of truth; re-check anything here before relying on it. No secrets are recorded in this file.
 
+## 2026-10-21 update — Redis Phase 6, Step 1 completed
+- Corrected repository state: this repository now has committed `backend/` and `frontend/` application code; the old note saying they were entirely untracked is stale.
+- Implemented files:
+  - `backend/src/config/redis.js` (optional Redis lifecycle manager with idempotent initialize/close, bounded reconnect attempts, sanitized error logging, health state reporting).
+  - `backend/src/health/readiness.js` (readiness payload for PostgreSQL + Redis dependency status).
+  - `backend/src/lifecycle/gracefulShutdown.js` (idempotent shutdown helper with server drain timeout and safe Redis/PG resource cleanup).
+  - `backend/src/app.js` (kept lightweight `/health` liveness; added `/health/ready` readiness endpoint).
+  - `backend/src/server.js` (startup now initializes optional Redis without making startup fatal; SIGINT/SIGTERM graceful shutdown wiring).
+  - `backend/.env.example` (added optional `REDIS_URL`, `SHUTDOWN_GRACE_MS`, `FORCE_SHUTDOWN_MS` placeholders).
+  - `backend/tests/redis-phase6-step1.test.js` and `backend/package.json` (`test:redis-phase6` script).
+- Redis decisions in this step:
+  - Redis is optional. Blank/missing `REDIS_URL` means no Redis connection attempt.
+  - Configured-but-unavailable Redis is logged with sanitized non-sensitive codes and reported as down; app startup still continues.
+  - Health never reports Redis as connected unless the client is actually open and ready.
+  - No Redis caching/rate-limiting/locks/pub-sub was added in this step.
+- Health behavior:
+  - `/health` => liveness `{ status: "ok" }`.
+  - `/health/ready` => dependency health with separate `postgresql` and `redis`.
+  - PostgreSQL down => readiness HTTP 503 and `status: "error"`.
+  - PostgreSQL up + Redis absent/unavailable => readiness HTTP 200 and `status: "degraded"` (Redis explicitly not healthy).
+- Graceful shutdown behavior:
+  - On signal: stop accepting new requests (`server.close`), wait up to `SHUTDOWN_GRACE_MS`, then close Redis and PostgreSQL safely.
+  - Shutdown is idempotent and logs repeated signal attempts without double-closing resources.
+  - Forced process termination is bounded by `FORCE_SHUTDOWN_MS` in `server.js`.
+- Tests and verification run (actual):
+  - `cd backend && npm run test:redis-phase6` ✅ passed (6/6).
+  - `cd backend && npm test` ❌ expected fail (`Error: no test specified`) because the repository still has no general backend test suite under `npm test`.
+  - Manual startup/shutdown verification executed with temporary env values via `node --input-type=module` script:
+    - `/health` returned 200 `{ status: "ok" }`
+    - `/health/ready` returned 503 with PostgreSQL down and Redis `not_configured`
+    - shutdown completed cleanly through the new graceful shutdown path.
+- Remaining limitations:
+  - No live Redis integration was run against a real Redis instance in this step.
+  - Existing non-Redis backend checks (`test:s3`, `test:ai`, `test:ai:scenario`, `test:ai:live`) still require external services/credentials and were not run here.
+- Exact next Phase 6 step:
+  - Phase 6, Step 2: add **safe TTL Redis caching** for selected read-heavy, non-sensitive endpoints with explicit invalidation and no cross-user data leakage.
+
 ## 1. Git state (important)
 - Branch `main`, one commit (`e716373 first commit`). `README.md` is modified; **`backend/` and `frontend/` are entirely untracked**, so none of the application code is committed yet.
 - No root `.gitignore`. `backend/.gitignore` ignores `.env` and `node_modules/`; `frontend/.gitignore` exists. Verified `backend/.env` is ignored.
