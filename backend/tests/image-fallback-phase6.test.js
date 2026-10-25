@@ -329,7 +329,7 @@ test('AI assessment — S3 key takes precedence over demo URL', async () => {
 // getEvidenceImage does: loadContext → pick key/url → resolveImage → return {body, type}
 // We replicate its conditional logic here with injected ctx.
 
-function fakeGetEvidenceImage(ctx, kind, imageId, resolveImageFn) {
+async function fakeGetEvidenceImage(ctx, kind, imageId, resolveImageFn) {
   let key, fallbackUrl, storedType
   if (kind === 'reference') {
     key = ctx.image_key
@@ -435,7 +435,7 @@ test('safeFetch — rejects redirect to blocked host', async () => {
   )
 })
 
-// ── summary ──────────────────────────────────────────────────────────────────
+// ── summary ───────────────────────────────────────────────────────────
 // All tests above run fully in-process with no real DB, network, or S3 calls.
 // The shared pool is intentionally NOT closed here so other test files are not
 // affected when this file is run as part of the full test suite.
