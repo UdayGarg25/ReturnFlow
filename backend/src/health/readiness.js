@@ -5,7 +5,11 @@ export async function getReadinessStatus({ dbPool = pool, redisHealthProvider = 
   let postgresUp = false;
 
   try {
-    await dbPool.query('SELECT 1');
+    const timeoutPromise = new Promise((_, reject) => {
+      const timer = setTimeout(() => reject(new Error('PostgreSQL readiness timed out')), 3000);
+      timer.unref?.();
+    });
+    await Promise.race([dbPool.query('SELECT 1'), timeoutPromise]);
     postgresUp = true;
   } catch {
     postgresUp = false;

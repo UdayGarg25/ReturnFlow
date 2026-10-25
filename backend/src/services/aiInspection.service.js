@@ -1,5 +1,7 @@
 import pool from '../config/db.js'
 import { conflict, forbidden, notFound } from '../utils/http.js'
+import { withLock, LockContentionError } from './redisLock.service.js'
+import { safeFetchImage, SsrfError, FetchError } from '../utils/safeFetch.js'
 
 // AI-assisted warehouse inspection: an ADVISORY comparison of the product's reference image with the customer's photos.
 // It never changes an inspection, a return or a refund. Staff still inspect the item and decide.
@@ -66,7 +68,48 @@ const SIGNATURES = [
   { type: 'image/webp', test: (b) => b.length > 12 && b.toString('ascii', 0, 4) === 'RIFF' && b.toString('ascii', 8, 12) === 'WEBP' },
 ]
 
+// Resolves one image from its S3 key (preferred) or a fallback URL (demo data).
+// `fallbackUrl` must come from a trusted DB column — it is validated by safeFetchImage.
+// Returns { bytes: Buffer, type: string } or throws AiError.
+async function resolveImage(key, fallbackUrl) {
+  // 1. Try S3 when a key is present
+  if (key) {
+    const { getObject } = await storage()
+    let object
+    try {
+      object = await getObject(key)
+    } catch (err) {
+      // Only fall through to the URL on a missing-key error; propagate real S3 failures.
+      if (err?.name !== 'NoSuchKey') throw new AiError('IMAGE_UNAVAILABLE')
+    }
+    if (object) {
+      const real = SIGNATURES.find((s) => s.test(object.body))
+      if (!real) throw new AiError('UNSUPPORTED_IMAGE')
+      if (object.body.length > MAX_IMAGE_BYTES) throw new AiError('IMAGES_TOO_LARGE')
+      return { bytes: object.body, type: real.type }
+    }
+  }
+
+  // 2. Fallback to the public placeholder URL (demo data only)
+  if (fallbackUrl) {
+    let fetched
+    try {
+      fetched = await safeFetchImage(fallbackUrl)
+    } catch (err) {
+      if (err instanceof SsrfError) throw new AiError('IMAGE_UNAVAILABLE')  // blocked URL — treat as missing
+      throw new AiError('IMAGE_UNAVAILABLE')
+    }
+    const real = SIGNATURES.find((s) => s.test(fetched.body))
+    if (!real) throw new AiError('UNSUPPORTED_IMAGE')
+    if (fetched.body.length > MAX_IMAGE_BYTES) throw new AiError('IMAGES_TOO_LARGE')
+    return { bytes: fetched.body, type: real.type }
+  }
+
+  throw new AiError('IMAGE_UNAVAILABLE')
+}
+
 // Reads one object from the private bucket (key comes from OUR database rows only) and checks what it really is.
+// Retained for the live smoke-test export; internal AI workflow now calls resolveImage directly.
 async function loadImage(key) {
   const { getObject } = await storage()
   let object
@@ -246,7 +289,9 @@ export function parseAssessment(text) {
 const CONTEXT_SQL = `
   SELECT i.id, i.status AS inspection_status, i.warehouse_staff_id,
          rr.id AS return_id, rr.status AS return_status, rr.reason, rr.description,
-         p.name AS product_name, p.description AS product_description, p.image_key
+         rr.customer_image_url,
+         p.name AS product_name, p.description AS product_description,
+         p.image_key, p.image_url AS product_image_url
     FROM inspections i
     JOIN return_requests rr ON rr.id = i.return_request_id
     JOIN products p ON p.id = rr.product_id
@@ -257,8 +302,14 @@ const AT_WAREHOUSE = ['WAREHOUSE_RECEIVED', 'INSPECTION']
 async function loadContext(inspectionId) {
   const { rows } = await pool.query(CONTEXT_SQL, [inspectionId])
   if (rows.length === 0) throw notFound('Inspection')
-  const photos = (await pool.query('SELECT id, image_key, image_type FROM return_images WHERE return_request_id = $1 ORDER BY id', [rows[0].return_id])).rows
-  return { ...rows[0], photos }
+  const row = rows[0]
+  const photos = (await pool.query('SELECT id, image_key, image_url, image_type FROM return_images WHERE return_request_id = $1 ORDER BY id', [row.return_id])).rows
+  // Demo data: return_images is empty but return_requests.customer_image_url may hold a placeholder URL.
+  // Represent it as a synthetic photo entry so the rest of the code sees at least one photo.
+  if (photos.length === 0 && row.customer_image_url) {
+    photos.push({ id: null, image_key: null, image_url: row.customer_image_url, image_type: null })
+  }
+  return { ...row, photos }
 }
 
 const eligible = (ctx) => OPEN_INSPECTION.includes(ctx.inspection_status) && AT_WAREHOUSE.includes(ctx.return_status)
@@ -266,7 +317,7 @@ const eligible = (ctx) => OPEN_INSPECTION.includes(ctx.inspection_status) && AT_
 // Why an assessment cannot start right now (or null). Pure checks on rows we already loaded.
 function unavailableCode(ctx) {
   if (!aiConfig().apiKey) return 'NOT_CONFIGURED'
-  if (!ctx.image_key) return 'NO_REFERENCE_IMAGE'
+  if (!ctx.image_key && !ctx.product_image_url) return 'NO_REFERENCE_IMAGE'
   if (ctx.photos.length === 0) return 'NO_RETURN_PHOTOS'
   return null
 }
@@ -298,7 +349,7 @@ export async function getAssessment(inspectionId) {
     completedAt: row?.completed_at ?? null,
     result: status === 'COMPLETED' ? row.result : null,
     error,
-    evidence: { hasReference: Boolean(ctx.image_key), photos: ctx.photos.map((p) => ({ id: p.id, type: p.image_type })) },
+    evidence: { hasReference: Boolean(ctx.image_key || ctx.product_image_url), photos: ctx.photos.map((p) => ({ id: p.id, type: p.image_type })) },
   }
 }
 
@@ -335,9 +386,9 @@ export async function assessEvidence(ctx, reference, photos) {
 export async function runAssessment({ id, attempt }, ctx) {
   const cfg = aiConfig()
   try {
-    const reference = await loadImage(ctx.image_key)
+    const reference = await resolveImage(ctx.image_key, ctx.product_image_url)
     const photos = []
-    for (const p of ctx.photos) photos.push(await loadImage(p.image_key))
+    for (const p of ctx.photos) photos.push(await resolveImage(p.image_key, p.image_url))
     if ([reference, ...photos].reduce((n, i) => n + i.bytes.length, 0) > MAX_TOTAL_IMAGE_BYTES) throw new AiError('IMAGES_TOO_LARGE')
     const { assessment } = await assessEvidence(ctx, reference, photos)
     await complete(id, attempt, assessment)
@@ -356,32 +407,78 @@ export async function startAssessment(staffId, inspectionId, { retry = false } =
   if (!eligible(ctx)) throw conflict('This inspection is not open for assessment.')
   const code = unavailableCode(ctx)
   if (code) throw conflict(messageFor(code))
-  const existing = await getRow(inspectionId)
-  if (retry && !(existing && (existing.status === 'FAILED' || isStale(existing)))) throw conflict('There is no failed assessment to retry.')
 
-  const claimed = await claim(inspectionId, aiConfig())
-  if (!claimed) throw conflict(existing?.status === 'COMPLETED' ? 'This inspection already has a completed AI assessment.' : 'An AI assessment is already running for this inspection.')
-  runAssessment(claimed, ctx).catch(() => {}) // not awaited on purpose; runAssessment records its own failures
-  return getAssessment(inspectionId)
+  try {
+    return await withLock(
+      `ai-assessment:${inspectionId}`,
+      async () => {
+        const existing = await getRow(inspectionId)
+        if (retry && !(existing && (existing.status === 'FAILED' || isStale(existing)))) {
+          throw conflict('There is no failed assessment to retry.')
+        }
+
+        const claimed = await claim(inspectionId, aiConfig())
+        if (!claimed) {
+          throw conflict(
+            existing?.status === 'COMPLETED'
+              ? 'This inspection already has a completed AI assessment.'
+              : 'An AI assessment is already running for this inspection.',
+          )
+        }
+        runAssessment(claimed, ctx).catch(() => {}) // not awaited on purpose; runAssessment records its own failures
+        return getAssessment(inspectionId)
+      },
+      {
+        ttlMs: 30_000,
+        timeoutMs: 0,
+        bypassIfDbGuarded: true,
+      },
+    )
+  } catch (err) {
+    if (err instanceof LockContentionError) {
+      throw conflict('An AI assessment is already being initiated for this inspection.')
+    }
+    throw err
+  }
 }
 
 // ------------------------------------------------------------------------ 6. what each role may read
 // Warehouse staff may view the evidence of an inspection: the reference image or one of the return's photos.
 export async function getEvidenceImage(inspectionId, kind, imageId) {
   const ctx = await loadContext(inspectionId)
-  let key, type
+  let key, fallbackUrl, storedType
+
   if (kind === 'reference') {
-    if (!ctx.image_key) throw notFound('Image')
+    // S3 key takes precedence; product_image_url is the demo fallback.
     key = ctx.image_key
+    fallbackUrl = ctx.product_image_url
+    if (!key && !fallbackUrl) throw notFound('Image')
   } else {
-    const photo = ctx.photos.find((p) => p.id === imageId)
+    // For a specific photo, find the return_images row; synthetic demo photos have id === null.
+    const photo = imageId != null
+      ? ctx.photos.find((p) => p.id === imageId)
+      : ctx.photos.find((p) => p.id === null)   // demo: no real imageId
     if (!photo) throw notFound('Image')
-    ;({ image_key: key, image_type: type } = photo)
+    key = photo.image_key
+    fallbackUrl = photo.image_url
+    storedType = photo.image_type
+    if (!key && !fallbackUrl) throw notFound('Image')
   }
-  const { getObject } = await storage()
-  let object
-  try { object = await getObject(key) } catch (err) { if (err.name === 'NoSuchKey') throw notFound('Image'); throw err }
-  return { body: object.body, type: type ?? SIGNATURES.find((s) => s.test(object.body))?.type ?? 'application/octet-stream' }
+
+  // Resolve: S3 first, then URL fallback.
+  // For getEvidenceImage we stream the body directly, so use the storage module for S3
+  // and safeFetchImage for the URL, both via resolveImage.
+  let result
+  try {
+    result = await resolveImage(key, fallbackUrl)
+  } catch {
+    throw notFound('Image')
+  }
+
+  return {
+    body: result.bytes,
+    type: storedType ?? result.type,
+  }
 }
 
 // The short version a seller may see for a return on their own product (the caller has already checked ownership).

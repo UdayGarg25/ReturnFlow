@@ -21,7 +21,7 @@ export function createGracefulShutdown({
     shutdownPromise = (async () => {
       logger.log(`Received ${signal}. Starting graceful shutdown...`);
 
-      if (server?.listening) {
+      if (server && typeof server.close === 'function' && server.listening) {
         let timedOut = false;
         const closePromise = new Promise((resolve) => {
           server.close((error) => {
@@ -30,11 +30,18 @@ export function createGracefulShutdown({
           });
         });
 
+        try {
+          server.closeIdleConnections?.();
+        } catch {
+          // ignore if unsupported
+        }
+
         const timeoutPromise = new Promise((resolve) => {
-          setTimeout(() => {
+          const timer = setTimeout(() => {
             timedOut = true;
             resolve();
-          }, shutdownGraceMs).unref();
+          }, shutdownGraceMs);
+          timer.unref?.();
         });
 
         await Promise.race([closePromise, timeoutPromise]);
@@ -42,8 +49,8 @@ export function createGracefulShutdown({
       }
 
       const resourceResults = await Promise.allSettled([
-        closeRedisClient(),
-        pgPool.end(),
+        typeof closeRedisClient === 'function' ? closeRedisClient() : Promise.resolve(),
+        pgPool && typeof pgPool.end === 'function' ? pgPool.end() : Promise.resolve(),
       ]);
 
       if (resourceResults[0].status === 'rejected') {

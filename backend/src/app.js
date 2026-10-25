@@ -12,8 +12,14 @@ import customerRoutes from './routes/customer.routes.js';
 import pickupRoutes from './routes/pickup.routes.js';
 import sellerRoutes from './routes/seller.routes.js';
 import warehouseRoutes from './routes/warehouse.routes.js';
+import productRoutes from './routes/product.routes.js';
+import { apiLimiter } from './middleware/rateLimit.middleware.js';
 
 const app = express();
+
+if (process.env.TRUST_PROXY) {
+  app.set('trust proxy', process.env.TRUST_PROXY === 'true' ? true : process.env.TRUST_PROXY);
+}
 
 // Browser origins allowed to call the API WITH cookies. Credentialed requests can
 // never use "*", so the origin must be listed explicitly (comma-separated in .env).
@@ -42,6 +48,9 @@ app.get('/health/ready', async (req, res) => {
   res.status(readiness.httpStatus).json(readiness.body);
 });
 
+// Global rate limiting for API routes (health checks are mounted above and exempt)
+app.use('/api', apiLimiter);
+
 // Public: only the auth endpoints. Every other /api router below starts with
 // authenticate + authorize(<role>) (see its routes file).
 app.use('/api/auth', authRoutes);
@@ -49,6 +58,7 @@ app.use('/api/invitations', invitationRoutes); // public, token-based
 app.use('/api/admin', adminRoutes);
 if (AI_TEST_ENABLED) app.use('/api/dev/ai-test', devAiTestRoutes); // development-only AI test scenario; never in production
 app.use('/api/demo', demoRoutes); // public demo helpers, restricted to the fixed demo accounts (see demo.service.js)
+app.use('/api/products', productRoutes);
 app.use('/api/customer', customerRoutes);
 app.use('/api/seller', sellerRoutes);
 app.use('/api/pickups', pickupRoutes);

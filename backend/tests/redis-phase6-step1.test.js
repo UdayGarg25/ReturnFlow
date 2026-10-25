@@ -1,9 +1,17 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
+import http from 'node:http';
+import app from '../src/app.js';
 import { createRedisManager } from '../src/config/redis.js';
 import { getReadinessStatus } from '../src/health/readiness.js';
 import { createGracefulShutdown } from '../src/lifecycle/gracefulShutdown.js';
+import { startServer } from '../src/server.js';
+import pool from '../src/config/db.js';
+
+test.after(async () => {
+  await pool.end().catch(() => {});
+});
 
 const createLogger = () => {
   const logs = [];
@@ -218,4 +226,265 @@ test('graceful shutdown handles close errors and timeout without throwing', asyn
     logger.logs.some(([level, msg]) => level === 'error' && msg.includes('PostgreSQL close error')),
     true,
   );
+});
+
+test('startServer fails cleanly and throws when PostgreSQL connection fails', async () => {
+  const logger = createLogger();
+  let serverCreated = false;
+  let listenCalled = false;
+
+  const mockPgPool = {
+    query: async () => {
+      throw new Error('connect ECONNREFUSED 127.0.0.1:5432');
+    },
+  };
+
+  const mockCreateServer = () => {
+    serverCreated = true;
+    return {
+      listen: () => {
+        listenCalled = true;
+      },
+    };
+  };
+
+  await assert.rejects(
+    startServer({
+      logger,
+      pgPool: mockPgPool,
+      createServer: mockCreateServer,
+      registerSignalHandlers: false,
+    }),
+    /Database connection failed: connect ECONNREFUSED/,
+  );
+
+  assert.equal(serverCreated, false);
+  assert.equal(listenCalled, false);
+  assert.equal(
+    logger.logs.some(([level, msg]) => level === 'error' && msg.includes('Database connection failed')),
+    true,
+  );
+});
+
+test('startServer succeeds when PostgreSQL is healthy even if Redis is unavailable', async () => {
+  const logger = createLogger();
+  let serverListened = false;
+
+  class FakeServer extends EventEmitter {
+    constructor() {
+      super();
+      this.listening = false;
+    }
+    listen(port, callback) {
+      this.listening = true;
+      serverListened = true;
+      setTimeout(callback, 2);
+      return this;
+    }
+    close(callback) {
+      this.listening = false;
+      setTimeout(callback, 2);
+      return this;
+    }
+  }
+
+  const mockPgPool = {
+    query: async () => ({ rows: [{ now: new Date().toISOString() }] }),
+    end: async () => {},
+  };
+
+  const result = await startServer({
+    logger,
+    pgPool: mockPgPool,
+    initializeRedisFn: async () => {
+      throw new Error('Redis connection error');
+    },
+    createServer: () => new FakeServer(),
+    registerSignalHandlers: false,
+  });
+
+  assert.equal(serverListened, true);
+  assert.equal(typeof result.shutdown, 'function');
+  await result.shutdown('test-complete');
+});
+
+test('startServer cleans up Redis if HTTP server listen fails', async () => {
+  const logger = createLogger();
+  let redisClosed = false;
+
+  class FailingServer extends EventEmitter {
+    listen() {
+      setTimeout(() => {
+        this.emit('error', new Error('EADDRINUSE: address already in use'));
+      }, 5);
+      return this;
+    }
+    close(cb) {
+      cb?.();
+    }
+  }
+
+  const mockPgPool = {
+    query: async () => ({ rows: [{ now: '2026-10-21' }] }),
+    end: async () => {},
+  };
+
+  await assert.rejects(
+    startServer({
+      logger,
+      pgPool: mockPgPool,
+      initializeRedisFn: async () => {},
+      closeRedisFn: async () => {
+        redisClosed = true;
+      },
+      createServer: () => new FailingServer(),
+      registerSignalHandlers: false,
+    }),
+    /EADDRINUSE/,
+  );
+
+  assert.equal(redisClosed, true);
+});
+
+test('startServer signal handler runs graceful shutdown and exits with 0', async () => {
+  const logger = createLogger();
+
+  class FakeProcess extends EventEmitter {
+    constructor() {
+      super();
+      this.exitCode = null;
+    }
+    exit(code) {
+      this.exitCode = code;
+    }
+  }
+
+  class FakeServer extends EventEmitter {
+    constructor() {
+      super();
+      this.listening = true;
+    }
+    listen(port, callback) {
+      setTimeout(callback, 2);
+      return this;
+    }
+    close(callback) {
+      this.listening = false;
+      setTimeout(callback, 2);
+      return this;
+    }
+  }
+
+  const fakeProcess = new FakeProcess();
+  let pgClosed = false;
+
+  const mockPgPool = {
+    query: async () => ({ rows: [{ now: '2026-10-21' }] }),
+    end: async () => {
+      pgClosed = true;
+    },
+  };
+
+  await startServer({
+    logger,
+    pgPool: mockPgPool,
+    initializeRedisFn: async () => {},
+    closeRedisFn: async () => {},
+    createServer: () => new FakeServer(),
+    processRef: fakeProcess,
+    registerSignalHandlers: true,
+  });
+
+  fakeProcess.emit('SIGTERM');
+
+  await new Promise((resolve) => setTimeout(resolve, 20));
+
+  assert.equal(pgClosed, true);
+  assert.equal(fakeProcess.exitCode, 0);
+});
+
+test('startServer signal handler forces exit with 1 on shutdown timeout', async () => {
+  const logger = createLogger();
+
+  class FakeProcess extends EventEmitter {
+    constructor() {
+      super();
+      this.exitCode = null;
+    }
+    exit(code) {
+      this.exitCode = code;
+    }
+  }
+
+  class HangingServer extends EventEmitter {
+    constructor() {
+      super();
+      this.listening = true;
+    }
+    listen(port, callback) {
+      setTimeout(callback, 2);
+      return this;
+    }
+    close() {
+      // Hangs intentionally: never calls callback
+    }
+  }
+
+  const fakeProcess = new FakeProcess();
+
+  const mockPgPool = {
+    query: async () => ({ rows: [{ now: '2026-10-21' }] }),
+    end: async () => {
+      // Hangs intentionally
+      await new Promise(() => {});
+    },
+  };
+
+  const { handleSignal } = await startServer({
+    logger,
+    pgPool: mockPgPool,
+    initializeRedisFn: async () => {},
+    closeRedisFn: async () => {},
+    createServer: () => new HangingServer(),
+    processRef: fakeProcess,
+    forceShutdownMs: 25,
+    registerSignalHandlers: false,
+  });
+
+  void handleSignal('SIGINT');
+
+  await new Promise((resolve) => setTimeout(resolve, 60));
+
+  assert.equal(fakeProcess.exitCode, 1);
+  assert.equal(
+    logger.logs.some(([level, msg]) => level === 'error' && msg.includes('Forced shutdown')),
+    true,
+  );
+});
+
+test('HTTP /health and /health/ready endpoints work as expected', async () => {
+  const testServer = http.createServer(app);
+  await new Promise((resolve) => testServer.listen(0, resolve));
+  const { port } = testServer.address();
+
+  try {
+    const livenessRes = await fetch(`http://127.0.0.1:${port}/health`);
+    assert.equal(livenessRes.status, 200);
+    const livenessBody = await livenessRes.json();
+    assert.deepEqual(livenessBody, { status: 'ok' });
+
+    const readinessRes = await fetch(`http://127.0.0.1:${port}/health/ready`);
+    assert.equal([200, 503].includes(readinessRes.status), true);
+    const readinessBody = await readinessRes.json();
+    assert.equal(typeof readinessBody.status, 'string');
+    assert.equal(typeof readinessBody.dependencies, 'object');
+    assert.equal(typeof readinessBody.dependencies.postgresql, 'object');
+    assert.equal(typeof readinessBody.dependencies.redis, 'object');
+    // Ensure no passwords or secrets are leaked in response
+    const bodyStr = JSON.stringify(readinessBody);
+    assert.equal(bodyStr.includes('password'), false);
+    assert.equal(bodyStr.includes('secret'), false);
+  } finally {
+    await new Promise((resolve) => testServer.close(resolve));
+  }
 });

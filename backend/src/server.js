@@ -8,62 +8,106 @@ import { createGracefulShutdown } from './lifecycle/gracefulShutdown.js';
 
 const PORT = process.env.PORT || 5000;
 const FORCE_SHUTDOWN_MS = Number(process.env.FORCE_SHUTDOWN_MS) || 15_000;
+const DB_CONNECT_TIMEOUT_MS = Number(process.env.DB_CONNECT_TIMEOUT_MS) || 5_000;
 
 export async function startServer({
   port = PORT,
   logger = console,
   createServer = http.createServer,
+  pgPool = pool,
+  initializeRedisFn = initializeRedis,
+  closeRedisFn = closeRedis,
+  forceShutdownMs = FORCE_SHUTDOWN_MS,
+  processRef = process,
+  registerSignalHandlers = true,
 } = {}) {
-  const server = createServer(app);
-
+  // Step 1: PostgreSQL connection check is mandatory.
+  // Fail startup cleanly and exit non-zero if the primary database check fails or times out.
   try {
-    const result = await pool.query('SELECT NOW()');
-    logger.log('Database connected:', result.rows[0]);
+    const timeoutPromise = new Promise((_, reject) => {
+      const timer = setTimeout(() => {
+        reject(new Error(`PostgreSQL connection check timed out after ${DB_CONNECT_TIMEOUT_MS}ms`));
+      }, DB_CONNECT_TIMEOUT_MS);
+      timer.unref?.();
+    });
+
+    const result = await Promise.race([pgPool.query('SELECT NOW()'), timeoutPromise]);
+    logger.log('Database connected:', result.rows?.[0] || 'ok');
   } catch (error) {
     logger.error('Database connection failed:', error.message);
+    throw new Error(`Database connection failed: ${error.message}`);
   }
 
-  await initializeRedis();
+  // Step 2: Initialize optional Redis.
+  // Startup must not fail solely because Redis is unavailable during this phase.
+  let redisInitialized = false;
+  try {
+    await initializeRedisFn();
+    redisInitialized = true;
+  } catch (error) {
+    logger.error('Redis initialization error:', error.message);
+  }
 
-  await new Promise((resolve) => {
-    server.listen(port, () => {
-      logger.log(`Server running on port ${port}`);
-      resolve();
+  // Step 3: Start HTTP listener. Clean up initialized resources if server fails to start.
+  let server;
+  try {
+    server = createServer(app);
+    await new Promise((resolve, reject) => {
+      server.once('error', reject);
+      server.listen(port, () => {
+        server.removeListener('error', reject);
+        logger.log(`Server running on port ${port}`);
+        resolve();
+      });
     });
-  });
+  } catch (error) {
+    logger.error('HTTP server startup failed:', error.message);
+    if (redisInitialized) {
+      await closeRedisFn().catch((err) => {
+        logger.error('Error closing Redis after startup failure:', err?.message || err);
+      });
+    }
+    throw error;
+  }
 
-  const shutdown = createGracefulShutdown({ server, logger, pgPool: pool, closeRedisClient: closeRedis });
+  const shutdown = createGracefulShutdown({
+    server,
+    logger,
+    pgPool,
+    closeRedisClient: closeRedisFn,
+  });
 
   const handleSignal = async (signal) => {
     const forceExitTimer = setTimeout(() => {
-      logger.error(`Forced shutdown after ${FORCE_SHUTDOWN_MS}ms`);
-      process.exit(1);
-    }, FORCE_SHUTDOWN_MS);
-    forceExitTimer.unref();
+      logger.error(`Forced shutdown after ${forceShutdownMs}ms`);
+      processRef.exit(1);
+    }, forceShutdownMs);
+    forceExitTimer.unref?.();
 
     try {
       await shutdown(signal);
       clearTimeout(forceExitTimer);
-      process.exit(0);
+      processRef.exit(0);
     } catch (error) {
       clearTimeout(forceExitTimer);
       logger.error('Shutdown failed:', error?.message || error);
-      process.exit(1);
+      processRef.exit(1);
     }
   };
 
-  process.once('SIGINT', () => {
-    void handleSignal('SIGINT');
-  });
-  process.once('SIGTERM', () => {
-    void handleSignal('SIGTERM');
-  });
+  if (registerSignalHandlers && processRef && typeof processRef.on === 'function') {
+    processRef.on('SIGINT', () => {
+      void handleSignal('SIGINT');
+    });
+    processRef.on('SIGTERM', () => {
+      void handleSignal('SIGTERM');
+    });
+    processRef.on('unhandledRejection', (reason) => {
+      logger.error('Unhandled promise rejection:', reason);
+    });
+  }
 
-  process.on('unhandledRejection', (reason) => {
-    logger.error('Unhandled promise rejection:', reason);
-  });
-
-  return { server, shutdown };
+  return { server, shutdown, handleSignal };
 }
 
 const isDirectRun = process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1];

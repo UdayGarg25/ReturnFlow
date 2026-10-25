@@ -2,6 +2,7 @@ import { createClient } from 'redis';
 
 const MAX_RECONNECT_ATTEMPTS = 3;
 const SOCKET_CONNECT_TIMEOUT_MS = 5000;
+const SOCKET_TIMEOUT_MS = Number(process.env.REDIS_SOCKET_TIMEOUT_MS) || 2000;
 
 const normalizeRedisUrl = (value) => (typeof value === 'string' ? value.trim() : '');
 const sanitizeRedisError = (error) => {
@@ -38,6 +39,7 @@ export function createRedisManager({ env = process.env, logger = console, create
       url: redisUrl,
       socket: {
         connectTimeout: SOCKET_CONNECT_TIMEOUT_MS,
+        timeout: SOCKET_TIMEOUT_MS,
         reconnectStrategy: (retries) => (retries >= MAX_RECONNECT_ATTEMPTS ? false : Math.min((retries + 1) * 250, 1000)),
       },
     });
@@ -113,6 +115,8 @@ export function createRedisManager({ env = process.env, logger = console, create
       try {
         if (client.isOpen) {
           await client.quit();
+        } else if (typeof client.disconnect === 'function') {
+          client.disconnect();
         }
       } catch (error) {
         lastErrorCode = sanitizeRedisError(error);
@@ -132,10 +136,13 @@ export function createRedisManager({ env = process.env, logger = console, create
     return closePromise;
   };
 
+  const getClient = () => (isConnected() ? client : null);
+
   return {
     initialize,
     close,
     getHealth,
+    getClient,
   };
 }
 
@@ -144,3 +151,4 @@ const redisManager = createRedisManager();
 export const initializeRedis = () => redisManager.initialize();
 export const closeRedis = () => redisManager.close();
 export const getRedisHealth = () => redisManager.getHealth();
+export const getRedisClient = () => redisManager.getClient();

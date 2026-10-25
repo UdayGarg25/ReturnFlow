@@ -1,86 +1,89 @@
 # ReturnFlow — Verified Project Context
 
-Last verified against the repository: 2026-10-18. The code is the source of truth; re-check anything here before relying on it. No secrets are recorded in this file.
+Last verified against the repository: 2026-10-23. The code is the source of truth; re-check anything here before relying on it. No secrets are recorded in this file.
 
-## 2026-10-21 update — Redis Phase 6, Step 1 completed
-- Corrected repository state: this repository now has committed `backend/` and `frontend/` application code; the old note saying they were entirely untracked is stale.
-- Implemented files:
-  - `backend/src/config/redis.js` (optional Redis lifecycle manager with idempotent initialize/close, bounded reconnect attempts, sanitized error logging, health state reporting).
-  - `backend/src/health/readiness.js` (readiness payload for PostgreSQL + Redis dependency status).
-  - `backend/src/lifecycle/gracefulShutdown.js` (idempotent shutdown helper with server drain timeout and safe Redis/PG resource cleanup).
-  - `backend/src/app.js` (kept lightweight `/health` liveness; added `/health/ready` readiness endpoint).
-  - `backend/src/server.js` (startup now initializes optional Redis without making startup fatal; SIGINT/SIGTERM graceful shutdown wiring).
-  - `backend/.env.example` (added optional `REDIS_URL`, `SHUTDOWN_GRACE_MS`, `FORCE_SHUTDOWN_MS` placeholders).
-  - `backend/tests/redis-phase6-step1.test.js` and `backend/package.json` (`test:redis-phase6` script).
-- Redis decisions in this step:
-  - Redis is optional. Blank/missing `REDIS_URL` means no Redis connection attempt.
-  - Configured-but-unavailable Redis is logged with sanitized non-sensitive codes and reported as down; app startup still continues.
-  - Health never reports Redis as connected unless the client is actually open and ready.
-  - No Redis caching/rate-limiting/locks/pub-sub was added in this step.
-- Health behavior:
-  - `/health` => liveness `{ status: "ok" }`.
-  - `/health/ready` => dependency health with separate `postgresql` and `redis`.
-  - PostgreSQL down => readiness HTTP 503 and `status: "error"`.
-  - PostgreSQL up + Redis absent/unavailable => readiness HTTP 200 and `status: "degraded"` (Redis explicitly not healthy).
-- Graceful shutdown behavior:
-  - On signal: stop accepting new requests (`server.close`), wait up to `SHUTDOWN_GRACE_MS`, then close Redis and PostgreSQL safely.
-  - Shutdown is idempotent and logs repeated signal attempts without double-closing resources.
-  - Forced process termination is bounded by `FORCE_SHUTDOWN_MS` in `server.js`.
-- Tests and verification run (actual):
-  - `cd backend && npm run test:redis-phase6` ✅ passed (6/6).
-  - `cd backend && npm test` ❌ expected fail (`Error: no test specified`) because the repository still has no general backend test suite under `npm test`.
-  - Manual startup/shutdown verification executed with temporary env values via `node --input-type=module` script:
-    - `/health` returned 200 `{ status: "ok" }`
-    - `/health/ready` returned 503 with PostgreSQL down and Redis `not_configured`
-    - shutdown completed cleanly through the new graceful shutdown path.
-- Remaining limitations:
-  - No live Redis integration was run against a real Redis instance in this step.
-  - Existing non-Redis backend checks (`test:s3`, `test:ai`, `test:ai:scenario`, `test:ai:live`) still require external services/credentials and were not run here.
-- Exact next Phase 6 step:
-  - Phase 6, Step 2: add **safe TTL Redis caching** for selected read-heavy, non-sensitive endpoints with explicit invalidation and no cross-user data leakage.
+## Current Development State: Phase 6, Step 4 — Redis Distributed Locks (Verified & Stable)
 
-## 1. Git state (important)
-- Branch `main`, one commit (`e716373 first commit`). `README.md` is modified; **`backend/` and `frontend/` are entirely untracked**, so none of the application code is committed yet.
-- No root `.gitignore`. `backend/.gitignore` ignores `.env` and `node_modules/`; `frontend/.gitignore` exists. Verified `backend/.env` is ignored.
-- Next safe housekeeping: review `git status`, then commit the work in logical commits (only when the owner asks).
+Phase 6 Step 1 established Redis foundation, health probes, and graceful shutdown.
+Phase 6 Step 2 introduced Cache-Aside TTL caching on catalog and seller inventory with explicit invalidation.
+Phase 6 Step 3 introduced distributed rate limiting using atomic Lua scripts and explicit fallback policies.
+Phase 6 Step 4 introduces a reusable Redis distributed lock service (`redisLock.service.js`) with atomic acquisition (`SET NX PX`), safe release via atomic compare-and-delete Lua script, bounded timeouts, and integration into the AI assessment workflow.
 
-## 2. Confirmed architecture
-- **Frontend:** React + Vite + Tailwind, React Router, lucide icons. Pages for admin, customer, pickup, seller, warehouse, shared profile, public `/demo`, invitation acceptance. Dev-only warehouse page `AiTestScenario.jsx` (route exists only when `import.meta.env.DEV`).
-- **Backend:** Node + Express 5, ES modules, raw parameterized SQL with `pg` (no ORM). Layers: `routes → middleware → controllers → services → SQL`. `src/models/` is empty. Config in `src/config/` (`schema.sql`, `seed.sql`, `seed-demo.sql`, `setup.js`, `seedAdmin.js`, `s3.js`, `db.js`, `auth.js`).
-- **Auth:** JWT in HttpOnly cookie, credentialed CORS allowlist, `authenticate` + `authorize(ROLE)` middleware, ownership checks in services. No token revocation (a copied JWT stays valid until expiry).
-- **Roles:** CUSTOMER, SELLER, PICKUP_AGENT, WAREHOUSE, ADMIN (DB `CHECK`). Invitations (SELLER/PICKUP_AGENT/WAREHOUSE) via Resend email.
-- **Storage:** PostgreSQL for business data; private S3 bucket (eu-north-1) for return photos and the Sony reference image; DB stores keys/metadata only.
-- **AI:** `@openrouter/sdk`; model/provider from env (defaults `dots-studio/dots-3-note-preview:free`, provider `atlas-cloud/fp8`, fallbacks disabled). Strict hand-written JSON validator; results in `ai_assessments`; advisory only.
+### 1. Implemented & Verified Files (Phase 6, Steps 1 through 4)
+- `backend/src/services/redisLock.service.js`:
+  - Reusable distributed lock manager (`acquireLock`, `releaseLock`, `withLock`).
+  - Key format: `rf:lock:${resourceKey}`.
+  - Ownership: UUIDv4 token (`crypto.randomUUID()`) guarantees unguessable, unique lock ownership per attempt.
+  - Acquisition: Single-command atomic `SET lockKey token NX PX ttlMs` (default 10,000ms via `REDIS_LOCK_DEFAULT_TTL_MS`).
+  - Contention & Timeout: Non-blocking try-once by default (`timeoutMs = 0`), or bounded retry loop (`timeoutMs`, `retryDelayMs = 50ms`).
+  - Safe Release: Atomic Lua script compare-and-delete (`if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) else return 0 end`). Prevents older owners from accidentally deleting a newer owner's lock if lease expires.
+  - Error Classes: `LockContentionError` (409 conflict), `LockTimeoutError`, and `RedisUnavailableError`.
+  - Resilience: `withLock` guarantees release in `finally` and preserves original business callback exceptions without release error masking. Supports `bypassIfDbGuarded` for operations independently protected by PostgreSQL constraints.
+- `backend/src/services/aiInspection.service.js`:
+  - Integrated `withLock('ai-assessment:${inspectionId}')` into `startAssessment`.
+  - Protects against duplicate concurrent background AI workflows, preventing redundant S3 image downloads and OpenRouter LLM billing.
+  - Contention raises `LockContentionError` mapped to HTTP 409 conflict.
+  - PostgreSQL's `INSERT ... ON CONFLICT (inspection_id) DO UPDATE` remains the durable source of truth; `bypassIfDbGuarded: true` ensures graceful fallback if Redis is offline.
+- `backend/src/config/redis.js`:
+  - Redis lifecycle manager with socket timeout (`REDIS_SOCKET_TIMEOUT_MS = 2000`) and safe client accessor `getRedisClient()`.
+- `backend/src/middleware/rateLimit.middleware.js`:
+  - Distributed rate limiting with atomic Lua scripts, `trust proxy` protections, credential hashing, and explicit fallback policies.
+- `backend/src/app.js`:
+  - Mounts `apiLimiter` on `/api/*`, exports safe proxy trust via `TRUST_PROXY`. Health endpoints remain exempt.
+- `backend/src/services/cache.service.js`:
+  - Reusable Cache-Aside helper with TTL and resilient fallback to PostgreSQL.
+- `backend/src/services/product.service.js` & `backend/src/routes/product.routes.js`:
+  - Public product catalog cached with TTL (`rf:catalog:all`, `rf:catalog:product:${id}`).
+- `backend/src/services/seller.service.js`:
+  - Seller product listing cached under seller-isolated keys (`rf:seller:${sellerId}:products`) with invalidation hooks.
+- `backend/tests/lock-phase6-step4.test.js` & `backend/package.json` (`test:lock-phase6`):
+  - 12-test deterministic suite covering acquisition, contention, independent resource keys, release authorization, expiry, safe compare-and-delete on expired locks, timeout handling, connection failures, error propagation, and AI assessment integration.
+- `backend/tests/ratelimit-phase6-step3.test.js` (`test:ratelimit-phase6`):
+  - 9-test deterministic suite for distributed limits, 429 Retry-After, IP spoofing defense, and login failures.
+- `backend/tests/cache-phase6-step2.test.js` (`test:cache-phase6`):
+  - 10-test deterministic suite for Cache-Aside, TTL, and tenant isolation.
+- `backend/tests/redis-phase6-step1.test.js` (`test:redis-phase6`):
+  - 12-test deterministic suite for Redis lifecycle, health probes, startup validation, and graceful shutdown.
 
-## 3. Verified state machines (from `schema.sql`)
-- Return: RETURN_REQUESTED, SELLER_APPROVED, SELLER_REJECTED, PICKUP_ASSIGNED, PICKED_UP, WAREHOUSE_RECEIVED, INSPECTION, INSPECTION_APPROVED, INSPECTION_REJECTED, REFUND_PENDING, REFUNDED, COMPLETED.
-- Pickup: ASSIGNED, ACCEPTED, PICKED_UP, FAILED, CANCELLED. Inspection: PENDING, IN_PROGRESS, APPROVED, REJECTED, MANUAL_REVIEW. Refund: PENDING, PROCESSING, COMPLETED, FAILED, CANCELLED. AI assessment: RUNNING, COMPLETED, FAILED. Order: PENDING, CONFIRMED, SHIPPED, DELIVERED, CANCELLED.
-- Automation: seller approval assigns a pickup; pickup `PICKED_UP` opens a warehouse inspection; warehouse approval creates a **PENDING refund record**. There is **no payment gateway**: `REFUND_PENDING` is not money paid.
+### 2. Verified Test Results
+- `npm run test:redis-phase6`: **12 / 12 passed**
+- `npm run test:cache-phase6`: **10 / 10 passed**
+- `npm run test:ratelimit-phase6`: **9 / 9 passed**
+- `npm run test:lock-phase6`: **12 / 12 passed**
+  - Verified:
+    1. A lock can be acquired when the key is available.
+    2. A second concurrent acquisition cannot acquire the same lock.
+    3. Different resource keys can be locked independently.
+    4. An owner can release its own lock.
+    5. A request with the wrong token cannot release another owner's lock.
+    6. An expired lock can be acquired again.
+    7. An older owner cannot delete a newer owner's lock after expiry and reacquisition.
+    8. Acquisition timeout and lock contention are handled correctly.
+    9. Redis connection errors follow the documented failure policy (`fail_closed` / `bypassIfDbGuarded`).
+    10. Callback errors propagate and cleanup is attempted safely.
+    11. A release error does not silently hide the original callback error.
+    12. `startAssessment` uses `withLock` with non-blocking fast-fail on lock contention.
+- **Total active Phase 6 tests passing: 43 / 43.**
 
-## 4. Completed features (verified present in code)
-Auth/RBAC; customer, seller, pickup, warehouse and admin APIs and UIs; invitations + email; demo seed data and guided `/demo`; lifecycle automation; customer Refunds page; private S3 layer; return photos (max 2, 5 MB, JPEG/PNG/WebP by signature, server-generated keys, status-restricted edits, authenticated streaming); Sony reference image + product images; AI-assisted warehouse inspection (async, persisted, polled, retry-safe, seller sees summary only); development-only isolated AI test scenario.
+### 3. Git & Workspace State
+- Branch: `copilot/udaygarg25returnflow`.
+- Application source code in `backend/` and `frontend/` is committed and tracked.
+- Local `backend/.env` is ignored by `.gitignore`.
 
-## 5. Redis / Docker / Socket.IO / Nginx — NOT implemented
-- No Redis, Socket.IO, Docker, Compose or Nginx code or files. No `Dockerfile`, no compose file, no nginx config.
-- **Discrepancy:** `backend/package.json` lists `redis`, `socket.io` and `mongoose` as dependencies, but nothing imports them (grep of `src/` and `scripts/` confirmed). `mongoose` is not part of the architecture and is a candidate for removal (ask first).
-- Rate limiting is in-memory per process (`rateLimit.middleware.js`, with a comment noting Redis is needed for multiple instances). No `trust proxy` setting. `server.js` has no graceful shutdown (no SIGTERM/SIGINT handling) and only a basic `/health`.
+### 4. Confirmed Architecture & Concurrency Control
+- **PostgreSQL is the source of truth.** All business data resides in PostgreSQL; Redis distributed locks are coordination aids, never replacements for database transactions, unique constraints, or state machines.
+- **Atomic Locking:** Atomic `SET NX PX` and atomic Compare-and-Delete Lua scripts prevent token leakage, race conditions, and accidental lock deletion across instances.
+- **Finite Leases:** Every lock has a finite lease duration (`REDIS_LOCK_DEFAULT_TTL_MS`); deadlocks from crashed workers are impossible.
 
-## 6. Scripts and tests (backend `package.json`)
-`dev`, `start`, `db:schema`, `db:seed`, `db:seed-demo`, `db:seed-admin`, `db:reset` (destructive), `setup:sony-image`, `test:s3`, `test:ai` (24 mocked checks), `test:ai:live` (opt-in, real quota), `test:ai:scenario` (12 checks, mock OpenRouter + real DB/S3). `npm test` is a placeholder. There is no general API test suite committed; earlier API/browser checks were ad-hoc scratch scripts. Frontend: `npm run lint`, `npm run build`.
-Last results (2026-10-17): `test:ai` 24/24, `test:ai:scenario` 12/12 (one earlier run failed with an unexplained `fetch failed`; reruns passed), `test:s3` passed, lint clean, build ok.
+### 5. Out of Scope for Phase 6 Step 4 (Status Confirmed)
+- Redis Pub/Sub / cross-instance event broadcasting: NOT yet implemented (scheduled for Step 5).
+- Socket.IO integration: NOT yet implemented (Phase 7).
+- Docker / Compose / Nginx: NOT implemented in this phase.
+- `mongoose`: Retained per scope boundary instructions until explicitly approved for removal.
 
-## 7. Known issues and open items
-- Real two-image live AI comparison is **pending**: needs a user-supplied real Sony WH-1000XM5 photo (use `/dashboard/dev/ai-test` with `AI_TEST_SCENARIO=true`, or `npm run test:ai:live -- --photo <file>`). Model accuracy is unmeasured.
-- Free model's shared pool can return HTTP 429; no retries are made automatically.
-- Guided demo uses shared data; concurrent visitors can interfere.
-- Demo accounts use `Password123!` per seed scripts; verify before relying on IDs (order 28 / product 3 / item 481 may be stale).
-- Rate limits are per process; in-memory counters will not work across instances.
-- Nothing is committed (see section 1).
+### 6. Known Limitations
+- No local live Redis server is running on port 6379 in this environment; all Redis interactions and failure modes are validated via deterministic mocks and unit tests.
+- Real Redis integration testing will be conducted before production deployment.
 
-## 8. Roadmap (not started: Redis phase and later)
-1. **Phase 6 Redis** (incremental): client + lifecycle/health/graceful shutdown → TTL caching of safe read-heavy data (never cross-user) → Redis-backed rate limiting preserving current limits → locks only for a justified operation (never replacing PG transactions) → Pub/Sub for cross-instance events (not durable).
-2. **Phase 7 Socket.IO:** authorized, per-user/role events for return, pickup, inspection and refund changes; Redis adapter; test reconnects and multiple instances.
-3. **Phase 9 Scaling:** Docker/Compose, Nginx proxy + load balance, multiple Node instances, health checks, graceful shutdown, `trust proxy`, shared state, deployment config. Do not claim horizontal scaling until multiple instances are actually run and tested.
-
-## 9. Recommended next step
-Commit the existing work (with owner approval), then start Phase 6 step 1 only: add a Redis client module (`src/config/redis.js`) with optional connection (app still boots without Redis), error handling, health reporting in `/health`, and graceful shutdown in `server.js`; local Redis via Docker or a local install. Propose the plan and get approval before coding. Keep AI advisory, keep the S3 bucket private, never print secrets.
+### 7. Precise Next Step
+- **Phase 6, Step 5:** Implement **Redis Pub/Sub** for cross-instance coordination and event broadcasting (e.g. invalidation events and preparing for Phase 7 Socket.IO adapter).

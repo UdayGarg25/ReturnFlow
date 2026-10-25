@@ -49,8 +49,16 @@ export default function Register() {
           <Link to="/login" className="rounded font-semibold text-brand-600 hover:text-brand-700">Login</Link>
         </>
       }
+      className="max-w-lg"
     >
-      <form onSubmit={handleSubmit} className="space-y-4" noValidate>
+      <Notice tone="info" className="mb-4">
+  <p className="font-medium mb-1">Before you register</p>
+  ReturnFlow works with e‑commerce brands to manage product returns. Your orders will become available when your shopping platform or retailer integrates with ReturnFlow.
+  <br />
+  <br />
+  Just exploring? Use our demo experience to explore ReturnFlow with sample data.
+</Notice>
+<form onSubmit={handleSubmit} className="space-y-4" noValidate>
         {error && <Notice tone="error">{error}</Notice>}
         <TextField label="Full name" icon={User} autoComplete="name" placeholder="John Doe" required {...field('name')} />
         <TextField label="Email address" icon={Mail} type="email" autoComplete="email" placeholder="example@returnflow.test" required {...field('email')} />

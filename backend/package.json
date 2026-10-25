@@ -17,7 +17,11 @@
     "test:ai": "node scripts/ai-inspection-test.js",
     "test:ai:live": "node scripts/ai-inspection-live-test.js",
     "test:ai:scenario": "node scripts/ai-test-scenario-test.js",
-    "test:redis-phase6": "node --test tests/redis-phase6-step1.test.js"
+    "test:redis-phase6": "node --test tests/redis-phase6-step1.test.js",
+    "test:cache-phase6": "node --test tests/cache-phase6-step2.test.js",
+    "test:ratelimit-phase6": "node --test tests/ratelimit-phase6-step3.test.js",
+    "test:lock-phase6": "node --test tests/lock-phase6-step4.test.js",
+    "test:image-fallback": "node --test tests/image-fallback-phase6.test.js"
   },
   "keywords": [],
   "author": "",

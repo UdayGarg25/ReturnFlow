@@ -2,6 +2,8 @@ import pool from '../config/db.js'
 import { getSellerSummary } from './aiInspection.service.js'
 import { defaultPickupAgent } from './assignment.js'
 import { conflict, notFound, validationError } from '../utils/http.js'
+import { cacheService } from './cache.service.js'
+import { invalidateCatalogCache } from './product.service.js'
 
 // Every query is scoped to the logged-in seller (sellerId comes from req.user).
 // A product, order or return that belongs to another seller is "not found". A
@@ -42,8 +44,10 @@ function validateProduct(input) {
 }
 
 export async function listProducts(sellerId) {
-  const { rows } = await pool.query(`SELECT ${PRODUCT_COLUMNS} FROM products WHERE seller_id = $1 ORDER BY id`, [sellerId])
-  return rows
+  return cacheService.remember(`rf:seller:${sellerId}:products`, 60, async () => {
+    const { rows } = await pool.query(`SELECT ${PRODUCT_COLUMNS} FROM products WHERE seller_id = $1 ORDER BY id`, [sellerId])
+    return rows
+  })
 }
 
 export async function getProduct(sellerId, productId) {
@@ -61,7 +65,12 @@ export async function createProduct(sellerId, input) {
      RETURNING ${PRODUCT_COLUMNS}`,
     [sellerId, p.name, p.description, p.price, p.imageUrl],
   )
-  return rows[0]
+  const product = rows[0]
+  await Promise.allSettled([
+    invalidateCatalogCache(product.id),
+    cacheService.del(`rf:seller:${sellerId}:products`),
+  ])
+  return product
 }
 
 // Ownership is part of the UPDATE itself, so there is no gap between "check" and "change".
@@ -75,13 +84,22 @@ export async function updateProduct(sellerId, productId, input) {
     [productId, sellerId, p.name, p.description, p.price, p.imageUrl],
   )
   if (rows.length === 0) throw notFound('Product')
-  return rows[0]
+  const product = rows[0]
+  await Promise.allSettled([
+    invalidateCatalogCache(productId),
+    cacheService.del(`rf:seller:${sellerId}:products`),
+  ])
+  return product
 }
 
 export async function deleteProduct(sellerId, productId) {
   try {
     const result = await pool.query('DELETE FROM products WHERE id = $1 AND seller_id = $2', [productId, sellerId])
     if (result.rowCount === 0) throw notFound('Product')
+    await Promise.allSettled([
+      invalidateCatalogCache(productId),
+      cacheService.del(`rf:seller:${sellerId}:products`),
+    ])
   } catch (err) {
     // order history references the product (ON DELETE RESTRICT): keep the record
     if (PG_REFERENCED.includes(err.code)) throw conflict('This product has orders or returns and cannot be deleted.')
