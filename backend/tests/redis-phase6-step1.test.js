@@ -473,17 +473,27 @@ test('HTTP /health and /health/ready endpoints work as expected', async () => {
     const livenessBody = await livenessRes.json();
     assert.deepEqual(livenessBody, { status: 'ok' });
 
+    // PUBLIC callers get only the overall status (no dependency names, states or error codes).
     const readinessRes = await fetch(`http://127.0.0.1:${port}/health/ready`);
     assert.equal([200, 503].includes(readinessRes.status), true);
     const readinessBody = await readinessRes.json();
-    assert.equal(typeof readinessBody.status, 'string');
-    assert.equal(typeof readinessBody.dependencies, 'object');
-    assert.equal(typeof readinessBody.dependencies.postgresql, 'object');
-    assert.equal(typeof readinessBody.dependencies.redis, 'object');
+    assert.deepEqual(Object.keys(readinessBody), ['status']);
+    assert.equal(['ok', 'degraded', 'error'].includes(readinessBody.status), true);
+
+    // A monitoring system with the shared token gets the dependency detail.
+    process.env.HEALTH_CHECK_TOKEN = 'monitoring-token-0123456789';
+    const detailRes = await fetch(`http://127.0.0.1:${port}/health/ready`, { headers: { 'X-Health-Token': 'monitoring-token-0123456789' } });
+    const detail = await detailRes.json();
+    assert.equal(typeof detail.status, 'string');
+    assert.equal(typeof detail.dependencies.postgresql, 'object');
+    assert.equal(typeof detail.dependencies.redis, 'object');
     // Ensure no passwords or secrets are leaked in response
-    const bodyStr = JSON.stringify(readinessBody);
+    const bodyStr = JSON.stringify(detail);
     assert.equal(bodyStr.includes('password'), false);
     assert.equal(bodyStr.includes('secret'), false);
+    // a wrong token is the same as no token
+    const wrong = await (await fetch(`http://127.0.0.1:${port}/health/ready`, { headers: { 'X-Health-Token': 'wrong-token-wrong-token' } })).json();
+    assert.deepEqual(Object.keys(wrong), ['status']);
   } finally {
     await new Promise((resolve) => testServer.close(resolve));
   }

@@ -1,5 +1,5 @@
 import crypto from 'node:crypto';
-import { getRedisClient } from '../config/redis.js';
+import { getRedisClient, getRedisHealth } from '../config/redis.js';
 
 export const DEFAULT_LOCK_TTL_MS = Number(process.env.REDIS_LOCK_DEFAULT_TTL_MS) || 10_000;
 export const DEFAULT_ACQUIRE_TIMEOUT_MS = Number(process.env.REDIS_LOCK_ACQUIRE_TIMEOUT_MS) || 0;
@@ -188,30 +188,25 @@ export async function withLock(
     lock = await acquireLock(resourceKey, { ttlMs, timeoutMs, retryDelayMs, getClient, logger });
   } catch (err) {
     if (err instanceof RedisUnavailableError && bypassIfDbGuarded) {
-      logger.warn?.(`Redis lock unavailable for "${resourceKey}". Proceeding with database-level protection only.`);
+      let state = 'unavailable';
+      try { const h = getRedisHealth(); state = h.configured ? h.state : 'not configured (REDIS_URL is not set)'; } catch { /* keep the generic word */ }
+      logger.warn?.(`Redis lock unavailable for "${resourceKey}" (${state}). Proceeding with database-level protection only.`);
       return callback(null);
     }
     throw err;
   }
 
-  let callbackError = null;
   let result;
-
   try {
     result = await callback(lock);
-  } catch (err) {
-    callbackError = err;
-    throw err;
   } finally {
-    if (lock) {
-      try {
-        await releaseLock(lock, { getClient, logger });
-      } catch (releaseErr) {
-        logger.error?.(`Failed to release lock "${lock.lockKey}":`, releaseErr.message);
-        if (!callbackError) {
-          throw releaseErr;
-        }
-      }
+    // The protected work is already done (or has already failed with its own error). A failure to release the lock
+    // must change neither outcome: it is logged, and the lock's finite TTL frees it. Ownership is still enforced by
+    // releaseLock (atomic compare-and-delete), so this can never remove somebody else's lock.
+    try {
+      await releaseLock(lock, { getClient, logger });
+    } catch (releaseErr) {
+      logger.error?.(`Failed to release lock "${lock.lockKey}" (it will expire on its own within ${lock.ttlMs}ms):`, releaseErr?.message ?? releaseErr);
     }
   }
 

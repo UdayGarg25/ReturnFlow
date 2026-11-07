@@ -15,6 +15,7 @@ router.get('/inspections/:id/ai-assessment', c.getAiAssessment)
 router.post('/inspections/:id/ai-assessment', aiAssessmentLimiter, c.startAiAssessment)
 router.post('/inspections/:id/ai-assessment/retry', aiAssessmentLimiter, c.retryAiAssessment)
 router.get('/inspections/:id/evidence/reference', c.referenceImage)
+router.get('/inspections/:id/evidence/demo-photo', c.demoPhoto)
 router.get('/inspections/:id/evidence/photos/:imageId', c.returnPhoto)
 
 export default router

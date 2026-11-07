@@ -1,12 +1,18 @@
 // Outgoing email. Everything provider-specific lives in this file; the rest of the backend only
 // calls sendInvitationEmail().
 //
-// Two transports:
+// Three transports:
+//   demo-blocked DEMO_ENABLED=true      -> NOTHING is ever sent, whatever else is configured (see below).
 //   resend       RESEND_API_KEY is set  -> the message is handed to Resend (https://resend.com).
 //   development  no key, NOT production -> nothing is sent; the message is logged on the server and
 //                the admin API returns the invitation link so the flow can be tried locally.
 // In production the key and sender are required: the process refuses to start without them, so
-// the app can never pretend to send email.
+// the app can never pretend to send email. The one exception is demo mode.
+//
+// DEMO MODE: with DEMO_ENABLED=true the app is a public demo whose Admin login is public on purpose, so any visitor can
+// call the admin invitation endpoints. This module is the only place that can reach an email provider, so it is
+// closed here, for every caller and every request, not in the UI: in demo mode the provider client is never created
+// (even if RESEND_API_KEY is set), sendInvitationEmail() returns without sending, and no credentials are needed to start.
 import { Resend } from 'resend'
 import { ServiceError } from '../utils/errors.js'
 
@@ -15,19 +21,21 @@ const apiKey = process.env.RESEND_API_KEY?.trim() || ''
 const fromEmail = process.env.RESEND_FROM_EMAIL?.trim() || ''
 const fromName = process.env.RESEND_FROM_NAME?.trim() || 'ReturnFlow'
 
-export const EMAIL_MODE = apiKey ? 'resend' : 'development'
+// Fail closed: any spelling of "true" (case, spaces) switches the block on.
+export const EMAIL_BLOCKED = /^true$/i.test(process.env.DEMO_ENABLED?.trim() ?? '')
+export const EMAIL_MODE = EMAIL_BLOCKED ? 'demo-blocked' : apiKey ? 'resend' : 'development'
 // True only for the local no-key fallback (the admin API then also returns the links).
 export const isDevEmail = EMAIL_MODE === 'development'
 
-if (isProduction && (!apiKey || !fromEmail)) {
+if (!EMAIL_BLOCKED && isProduction && (!apiKey || !fromEmail)) {
   throw new Error('RESEND_API_KEY and RESEND_FROM_EMAIL must be set in production (see backend/.env.example).')
 }
-if (apiKey && !fromEmail) {
+if (!EMAIL_BLOCKED && apiKey && !fromEmail) {
   throw new Error('RESEND_API_KEY is set but RESEND_FROM_EMAIL is not. Set a sender your Resend account may use (e.g. onboarding@resend.dev for testing).')
 }
 
 // One client for the whole process, created only when a key exists. The key never leaves this module.
-const resend = apiKey ? new Resend(apiKey) : null
+const resend = !EMAIL_BLOCKED && apiKey ? new Resend(apiKey) : null
 const from = `${fromName.replace(/[<>"\r\n]/g, '')} <${fromEmail}>`
 
 // Base URL of the web app, used for links in emails (never taken from a request).
@@ -85,6 +93,7 @@ function buildInvitation({ role, link, expiresAt, message }) {
 //   it does NOT promise that it reached an inbox.
 const TRANSPORTS = {
   resend: async ({ to, subject, text, html }) => {
+    if (EMAIL_BLOCKED || !resend) throw new ServiceError('EMAIL_SEND_FAILED', 'Email delivery is not available.') // belt and braces
     let result
     try {
       result = await resend.emails.send({ from, to: [to], subject, html, text })
@@ -101,6 +110,12 @@ const TRANSPORTS = {
     return { accepted: true, providerId: result.data?.id }
   },
 
+  // Demo mode: sends nothing, logs one line without the recipient or the message.
+  'demo-blocked': async () => {
+    console.warn('[email:demo] Email delivery is blocked in demo mode; nothing was sent.')
+    return { accepted: false, blocked: true }
+  },
+
   // Local fallback only (see top of file): logs, sends nothing.
   development: async ({ to, subject, text }) => {
     console.log(`[email:dev] to=${to} subject="${subject}"\n${text}`)
@@ -110,6 +125,8 @@ const TRANSPORTS = {
 
 // Sends the invitation to ONE recipient. Resolves to { accepted, providerId?, link }.
 export async function sendInvitationEmail({ to, role, token, expiresAt, message }) {
+  // Demo mode returns before anything is built: no link, no provider, no send.
+  if (EMAIL_BLOCKED) return TRANSPORTS['demo-blocked']()
   const link = invitationLink(token)
   const content = buildInvitation({ role, link, expiresAt, message })
   const result = await TRANSPORTS[EMAIL_MODE]({ to, ...content })

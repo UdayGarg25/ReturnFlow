@@ -1,7 +1,8 @@
 import pool from '../config/db.js'
 import { conflict, forbidden, notFound } from '../utils/http.js'
 import { withLock, LockContentionError } from './redisLock.service.js'
-import { safeFetchImage, SsrfError, FetchError } from '../utils/safeFetch.js'
+import { safeFetchImage } from '../utils/safeFetch.js'
+import { isDemoFixtureRef, readDemoFixture } from '../utils/demoFixtures.js'
 
 // AI-assisted warehouse inspection: an ADVISORY comparison of the product's reference image with the customer's photos.
 // It never changes an inspection, a return or a refund. Staff still inspect the item and decide.
@@ -50,6 +51,7 @@ const MESSAGES = {
   AUTH_FAILED: 'The AI service rejected this server\'s credentials. Please inspect manually and ask an administrator to check the configuration.',
   TIMEOUT: 'The AI assessment took too long or was interrupted. You can try again or inspect manually.',
   EMPTY_RESPONSE: 'The AI service returned no answer. You can try again or inspect manually.',
+  CONTENT_FILTERED: 'The AI service safety filter blocked this assessment, so there is no AI answer for these photos. Please inspect the item manually.',
   TRUNCATED: 'The AI answer was cut off. You can try again or inspect manually.',
   REFUSED: 'The AI service declined to assess these images. Please inspect manually.',
   INVALID_RESPONSE: 'The AI answer was not in the expected format, so it was discarded. You can try again or inspect manually.',
@@ -71,10 +73,10 @@ const SIGNATURES = [
 // Resolves one image from its S3 key (preferred) or a fallback URL (demo data).
 // `fallbackUrl` must come from a trusted DB column — it is validated by safeFetchImage.
 // Returns { bytes: Buffer, type: string } or throws AiError.
-async function resolveImage(key, fallbackUrl) {
+export async function resolveImage(key, fallbackUrl, { getObject: getObjectFn, fetchImage = safeFetchImage } = {}) {
   // 1. Try S3 when a key is present
   if (key) {
-    const { getObject } = await storage()
+    const getObject = getObjectFn ?? (await storage()).getObject
     let object
     try {
       object = await getObject(key)
@@ -90,14 +92,19 @@ async function resolveImage(key, fallbackUrl) {
     }
   }
 
-  // 2. Fallback to the public placeholder URL (demo data only)
+  // 2. Fallback: a bundled demo fixture (no network), or a public https URL fetched only through safeFetchImage
   if (fallbackUrl) {
     let fetched
     try {
-      fetched = await safeFetchImage(fallbackUrl)
-    } catch (err) {
-      if (err instanceof SsrfError) throw new AiError('IMAGE_UNAVAILABLE')  // blocked URL — treat as missing
-      throw new AiError('IMAGE_UNAVAILABLE')
+      if (isDemoFixtureRef(fallbackUrl)) {
+        const body = await readDemoFixture(fallbackUrl)
+        if (!body) throw new Error('missing fixture')
+        fetched = { body }
+      } else {
+        fetched = await fetchImage(fallbackUrl)
+      }
+    } catch {
+      throw new AiError('IMAGE_UNAVAILABLE') // blocked, unreachable or missing: the caller only learns "unavailable"
     }
     const real = SIGNATURES.find((s) => s.test(fetched.body))
     if (!real) throw new AiError('UNSUPPORTED_IMAGE')
@@ -193,8 +200,25 @@ function providerDetail(err) {
   }
 }
 
+// One-line, secret-free diagnostics for the server log. Only whitelisted scalar fields are printed: never the API key,
+// headers, prompt, image data or the model's text.
+const logAi = (level, label, fields) => {
+  const line = Object.entries(fields).filter(([, v]) => v !== undefined && v !== null && v !== '').map(([k, v]) => `${k}=${typeof v === 'string' ? v.replace(/[^\w./:@+-]/g, '_').slice(0, 80) : v}`).join(' ')
+  console[level](`[ai] ${label} ${line}`)
+}
+const errorCodeOf = (err) => {
+  try {
+    const body = typeof err?.body === 'string' ? JSON.parse(err.body) : err?.body
+    const code = body?.error?.code ?? body?.code
+    return typeof code === 'string' || typeof code === 'number' ? code : undefined
+  } catch {
+    return undefined
+  }
+}
+
 async function askModel(cfg, messages) {
   const client = await getClient(cfg)
+  const started = Date.now()
   let res
   try {
     res = await client.chat.send(
@@ -218,16 +242,32 @@ async function askModel(cfg, messages) {
     if (err?.name === 'ResponseValidationError' && err.statusCode >= 200 && err.statusCode < 300 && Array.isArray(err.rawValue?.choices)) {
       res = err.rawValue
     } else {
-      console.error(`[ai] provider request failed (${err?.name ?? 'error'}${err?.statusCode ? ` ${err.statusCode}` : ''})`)
+      logAi('error', 'provider request failed', { provider: cfg.provider, model: cfg.model, error: err?.name ?? 'error', status: err?.statusCode, providerCode: errorCodeOf(err), ms: Date.now() - started })
       throw Object.assign(new AiError(classifyProviderError(err)), { httpStatus: err?.statusCode ?? null, detail: providerDetail(err) })
     }
   }
   const choice = res?.choices?.[0]
+  const content = choice?.message?.content
+  const text = typeof content === 'string' ? content : Array.isArray(content) ? content.map((p) => p?.text ?? '').join('') : ''
+  const reasoning = choice?.message?.reasoning ?? choice?.message?.reasoningContent
+  const usage = res?.usage
+  const diag = {
+    provider: cfg.provider, model: cfg.model, responseModel: res?.model, requestId: res?.id,
+    choices: Array.isArray(res?.choices) ? res.choices.length : 'none',
+    finishReason: choice?.finishReason ?? choice?.finish_reason, nativeFinishReason: choice?.nativeFinishReason ?? choice?.native_finish_reason,
+    content: content === undefined ? 'absent' : content === null ? 'null' : Array.isArray(content) ? 'array' : typeof content,
+    textChars: text.length, reasoningChars: typeof reasoning === 'string' ? reasoning.length : 0,
+    refusal: Boolean(choice?.message?.refusal), messageKeys: choice?.message ? Object.keys(choice.message).join(',') : 'none',
+    completionTokens: usage?.completionTokens ?? usage?.completion_tokens, promptTokens: usage?.promptTokens ?? usage?.prompt_tokens, ms: Date.now() - started,
+  }
+  if (!choice || !text.trim() || choice.message?.refusal || diag.finishReason === 'length') logAi('error', 'unusable provider response', diag)
+  else logAi('log', 'provider response ok', diag)
   if (!choice) throw new AiError('EMPTY_RESPONSE')
   if (choice.message?.refusal) throw new AiError('REFUSED')
-  if ((choice.finishReason ?? choice.finish_reason) === 'length') throw new AiError('TRUNCATED')
-  const content = choice.message?.content
-  const text = typeof content === 'string' ? content : Array.isArray(content) ? content.map((p) => p?.text ?? '').join('') : ''
+  if (diag.finishReason === 'length') throw new AiError('TRUNCATED')
+  // The provider stopped the answer with its own safety filter (finish_reason "content_filter"): there is no answer text, but
+  // that is not an "empty answer" bug, and staff need to know it was filtered rather than that the service said nothing.
+  if (diag.finishReason === 'content_filter') throw new AiError('CONTENT_FILTERED')
   if (!text.trim()) throw new AiError('EMPTY_RESPONSE')
   const u = res.usage
   return { text, usage: u ? { promptTokens: u.promptTokens ?? u.prompt_tokens ?? null, completionTokens: u.completionTokens ?? u.completion_tokens ?? null } : null }
@@ -299,11 +339,14 @@ const CONTEXT_SQL = `
 const OPEN_INSPECTION = ['PENDING', 'IN_PROGRESS', 'MANUAL_REVIEW']
 const AT_WAREHOUSE = ['WAREHOUSE_RECEIVED', 'INSPECTION']
 
-async function loadContext(inspectionId) {
-  const { rows } = await pool.query(CONTEXT_SQL, [inspectionId])
+// `db` is injectable so tests can run it inside a rolled-back transaction.
+export async function loadContext(inspectionId, db = pool) {
+  const { rows } = await db.query(CONTEXT_SQL, [inspectionId])
   if (rows.length === 0) throw notFound('Inspection')
   const row = rows[0]
-  const photos = (await pool.query('SELECT id, image_key, image_url, image_type FROM return_images WHERE return_request_id = $1 ORDER BY id', [row.return_id])).rows
+  // return_images has no URL column: customer uploads are always S3 keys. Only demo data carries a URL (below).
+  const photos = (await db.query('SELECT id, image_key, image_type FROM return_images WHERE return_request_id = $1 ORDER BY id', [row.return_id])).rows
+    .map((p) => ({ ...p, image_url: null }))
   // Demo data: return_images is empty but return_requests.customer_image_url may hold a placeholder URL.
   // Represent it as a synthetic photo entry so the rest of the code sees at least one photo.
   if (photos.length === 0 && row.customer_image_url) {
@@ -349,7 +392,7 @@ export async function getAssessment(inspectionId) {
     completedAt: row?.completed_at ?? null,
     result: status === 'COMPLETED' ? row.result : null,
     error,
-    evidence: { hasReference: Boolean(ctx.image_key || ctx.product_image_url), photos: ctx.photos.map((p) => ({ id: p.id, type: p.image_type })) },
+    evidence: { hasReference: Boolean(ctx.image_key || ctx.product_image_url), photos: ctx.photos.map((p) => ({ id: p.id, type: p.image_type, demo: p.id === null })) },
   }
 }
 
@@ -377,9 +420,28 @@ const fail = (id, attempt, code) => pool.query(`UPDATE ai_assessments SET status
 // The model call itself, with no database involved: images in, validated advisory assessment out. Used by the real
 // workflow (runAssessment) and by the opt-in live smoke test (scripts/ai-inspection-live-test.js), so both use one
 // request implementation. `ctx` only needs product_name, product_description, reason and description.
-export async function assessEvidence(ctx, reference, photos) {
+const FILTER_NOTE = 'The customer description text was not sent to the AI (the provider safety filter blocked the first attempt), so this assessment is based on the photos and the reason code only.'
+
+async function assessOnce(ctx, reference, photos) {
   const { text, usage } = await askModel(aiConfig(), buildMessages(ctx, reference, photos))
   return { assessment: parseAssessment(text), usage }
+}
+
+// The provider's safety filter sometimes blocks a request because of the customer's FREE TEXT (observed live: the same
+// images pass with the structured reason code alone, and are blocked once a short typo-ridden description is added). The
+// free text is optional, untrusted context, so when, and only when, the filter fires, ONE more attempt is made without it
+// and the result says so in its limitations. Rate limits, timeouts and every other failure are never retried here.
+export async function assessEvidence(ctx, reference, photos) {
+  try {
+    return await assessOnce(ctx, reference, photos)
+  } catch (err) {
+    if (!(err instanceof AiError) || err.code !== 'CONTENT_FILTERED' || !String(ctx.description ?? '').trim()) throw err
+    logAi('warn', 'content filter hit; retrying once without the customer description', { inspection: ctx.id, provider: aiConfig().provider })
+    const second = await assessOnce({ ...ctx, description: null }, reference, photos)
+    const limitations = second.assessment.limitations
+    second.assessment.limitations = limitations.length < 5 ? [...limitations, FILTER_NOTE] : [...limitations.slice(0, 4), FILTER_NOTE]
+    return second
+  }
 }
 
 // The slow part. Runs after the HTTP request has already been answered; every failure ends as a FAILED row.
@@ -390,11 +452,14 @@ export async function runAssessment({ id, attempt }, ctx) {
     const photos = []
     for (const p of ctx.photos) photos.push(await resolveImage(p.image_key, p.image_url))
     if ([reference, ...photos].reduce((n, i) => n + i.bytes.length, 0) > MAX_TOTAL_IMAGE_BYTES) throw new AiError('IMAGES_TOO_LARGE')
+    logAi('log', 'evidence loaded', { inspection: ctx.id, attempt, reference: `${reference.type}/${reference.bytes.length}B`, photos: photos.map((p) => `${p.type}/${p.bytes.length}B`).join(',') })
     const { assessment } = await assessEvidence(ctx, reference, photos)
     await complete(id, attempt, assessment)
+    logAi('log', 'assessment saved', { inspection: ctx.id, attempt, overall: assessment.overallAssessment })
   } catch (err) {
     const code = err instanceof AiError ? err.code : 'INTERNAL'
     if (!(err instanceof AiError)) console.error(`[ai] unexpected error (${err?.name ?? 'error'})`)
+    logAi('error', 'assessment failed', { inspection: ctx.id, attempt, code })
     await fail(id, attempt, code).catch(() => console.error('[ai] could not record the failure'))
   }
 }
@@ -444,8 +509,8 @@ export async function startAssessment(staffId, inspectionId, { retry = false } =
 
 // ------------------------------------------------------------------------ 6. what each role may read
 // Warehouse staff may view the evidence of an inspection: the reference image or one of the return's photos.
-export async function getEvidenceImage(inspectionId, kind, imageId) {
-  const ctx = await loadContext(inspectionId)
+export async function getEvidenceImage(inspectionId, kind, imageId, { db = pool, resolve = resolveImage } = {}) {
+  const ctx = await loadContext(inspectionId, db)
   let key, fallbackUrl, storedType
 
   if (kind === 'reference') {
@@ -454,10 +519,11 @@ export async function getEvidenceImage(inspectionId, kind, imageId) {
     fallbackUrl = ctx.product_image_url
     if (!key && !fallbackUrl) throw notFound('Image')
   } else {
-    // For a specific photo, find the return_images row; synthetic demo photos have id === null.
-    const photo = imageId != null
-      ? ctx.photos.find((p) => p.id === imageId)
-      : ctx.photos.find((p) => p.id === null)   // demo: no real imageId
+    // 'photo' is ONLY a real return_images row, found by its numeric id. The sample photo of a demo return (kept in
+    // return_requests.customer_image_url, no database id) is a separate, explicit kind: 'demo-photo'.
+    const photo = kind === 'demo-photo'
+      ? ctx.photos.find((p) => p.id === null)
+      : Number.isInteger(imageId) ? ctx.photos.find((p) => p.id === imageId) : undefined
     if (!photo) throw notFound('Image')
     key = photo.image_key
     fallbackUrl = photo.image_url
@@ -470,7 +536,7 @@ export async function getEvidenceImage(inspectionId, kind, imageId) {
   // and safeFetchImage for the URL, both via resolveImage.
   let result
   try {
-    result = await resolveImage(key, fallbackUrl)
+    result = await resolve(key, fallbackUrl)
   } catch {
     throw notFound('Image')
   }
@@ -505,6 +571,6 @@ export async function getSellerSummary(returnId) {
 }
 
 // exposed for the deterministic tests (scripts/ai-inspection-test.js)
-export const _internals = { validateAssessment, parseAssessment, classifyProviderError }
+export const _internals = { validateAssessment, parseAssessment, classifyProviderError, buildMessages }
 // for the live smoke test: load an image from the private bucket / check a local image the same way, and the safe messages
 export { loadImage, messageFor, AiError, SIGNATURES, MAX_IMAGE_BYTES, MAX_TOTAL_IMAGE_BYTES }

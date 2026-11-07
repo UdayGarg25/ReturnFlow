@@ -1,441 +1,162 @@
 /**
- * image-fallback-phase6.test.js
+ * image-fallback-phase6.test.js - UNIT tests (no network, no S3, no PostgreSQL) of the PRODUCTION image resolution in
+ * src/services/aiInspection.service.js: resolveImage and getEvidenceImage. Nothing from the service is copied here.
+ * External services are injected through the service's own parameters:
+ *   - resolveImage(key, url, { getObject, fetchImage })      S3 and the URL fetcher
+ *   - getEvidenceImage(id, kind, imageId, { db, resolve })   a fake db whose query() returns canned rows
+ * The SQL itself is checked against the real schema in ai-context.integration.test.js; the SSRF guarantees of the real
+ * fetcher are in safefetch-security.test.js.
  *
- * Tests for the demo-image fallback in safeFetch.js and aiInspection.service.js.
- *
- * Strategy:
- *  - All tests use in-process mocks. No real database queries, no real HTTP
- *    requests, and no real S3 calls are made.
- *  - The DB pool is never closed so other test files that import it are not broken.
- *  - node:test / node:assert are the only test infrastructure (same as the
- *    existing Phase 6 test files).
- *
- * Run:  node --test tests/image-fallback-phase6.test.js
+ * Run: node --test tests/image-fallback-phase6.test.js
  */
-
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import http from 'node:http'
+import { AiError, getEvidenceImage, resolveImage } from '../src/services/aiInspection.service.js'
+import { SsrfError } from '../src/utils/safeFetch.js'
 
-// ─── helpers: tiny in-process HTTP image server ─────────────────────────────
+const PNG = Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), Buffer.alloc(40, 1)])
+const JPG = Buffer.concat([Buffer.from([0xff, 0xd8, 0xff, 0xe0]), Buffer.alloc(40, 2)])
+const WEBP = Buffer.concat([Buffer.from('RIFF'), Buffer.alloc(4), Buffer.from('WEBP'), Buffer.alloc(20)])
+const HTML = Buffer.from('<html>not an image</html>')
+const noSuchKey = () => Object.assign(new Error('missing'), { name: 'NoSuchKey' })
+const code = (c) => (e) => e instanceof AiError && e.code === c
 
-// 1×1 JPEG (smallest valid JPEG)
-const JPEG_1x1 = Buffer.from(
-  'ffd8ffe000104a46494600010100000100010000ffdb004300080606070605080707070909080a0c' +
-  '140d0c0b0b0c1912130f141d1a1f1e1d1a1c1c20242e2720222c231c1c2837292c30313434341f' +
-  '27393d38323c2e333432ffdb0043010909090c0b0c180d0d1832211c213232323232323232323232' +
-  '323232323232323232323232323232323232323232323232323232323232323232323232323232' +
-  'ffc0000b080001000101011100ffc40014000100000000000000000000000000000000ffc40014' +
-  '100100000000000000000000000000000000ffda00080101000003f0007fffd9',
-  'hex',
-)
-
-// 1×1 PNG
-const PNG_1x1 = Buffer.from(
-  '89504e470d0a1a0a0000000d49484452000000010000000108020000009001' +
-  '2e0000000c49444154789c62f8cfc00000000200013420600000000049454e44ae426082',
-  'hex',
-)
-
-// Not a valid image (random bytes)
-const NOT_AN_IMAGE = Buffer.from('This is not an image at all!')
-
-// Starts a local HTTP server that serves a given body/status for every request.
-function startServer(handler) {
-  return new Promise((resolve) => {
-    const server = http.createServer(handler)
-    server.listen(0, '127.0.0.1', () => {
-      const { port } = server.address()
-      resolve({ server, port })
-    })
-  })
+// a recording pair of fakes
+function fakes({ s3 = {}, urls = {} } = {}) {
+  const calls = { s3: [], urls: [] }
+  return {
+    calls,
+    deps: {
+      getObject: async (key) => { calls.s3.push(key); const v = s3[key]; if (v instanceof Error) throw v; if (v === undefined) throw noSuchKey(); return { body: v, contentType: 'x' } },
+      fetchImage: async (url) => { calls.urls.push(url); const v = urls[url]; if (v instanceof Error) throw v; if (v === undefined) throw new Error('unexpected url'); return { body: v, contentType: 'x' } },
+    },
+  }
 }
 
-function stopServer(server) {
-  return new Promise((resolve) => server.close(() => resolve()))
+// ------------------------------------------------------------------------------------------------ resolveImage
+test('resolveImage: an S3 key is preferred, the URL is not even fetched, and the type comes from the bytes', async () => {
+  const f = fakes({ s3: { 'a/key.png': PNG }, urls: { 'https://img.test/a.jpg': JPG } })
+  const r = await resolveImage('a/key.png', 'https://img.test/a.jpg', f.deps)
+  assert.deepEqual([r.type, r.bytes.equals(PNG)], ['image/png', true])
+  assert.deepEqual(f.calls.urls, [])
+})
+
+test('resolveImage: no key -> the demo URL is used (JPEG, PNG and WebP are recognised)', async () => {
+  for (const [bytes, type] of [[JPG, 'image/jpeg'], [PNG, 'image/png'], [WEBP, 'image/webp']]) {
+    const f = fakes({ urls: { 'https://img.test/x': bytes } })
+    const r = await resolveImage(null, 'https://img.test/x', f.deps)
+    assert.equal(r.type, type)
+    assert.deepEqual(f.calls.s3, [])
+  }
+})
+
+test('resolveImage: a key that is MISSING in S3 (NoSuchKey) falls back to the URL', async () => {
+  const f = fakes({ urls: { 'https://img.test/a.jpg': JPG } })
+  const r = await resolveImage('gone/key.png', 'https://img.test/a.jpg', f.deps)
+  assert.equal(r.type, 'image/jpeg')
+  assert.deepEqual(f.calls.s3, ['gone/key.png'])
+  assert.deepEqual(f.calls.urls, ['https://img.test/a.jpg'])
+})
+
+test('resolveImage: any OTHER S3 failure is an error and does NOT silently fall back to the URL', async () => {
+  for (const name of ['AccessDenied', 'InternalError', 'TimeoutError', 'NetworkingError']) {
+    const f = fakes({ s3: { k: Object.assign(new Error(name), { name }) }, urls: { 'https://img.test/a.jpg': JPG } })
+    await assert.rejects(() => resolveImage('k', 'https://img.test/a.jpg', f.deps), code('IMAGE_UNAVAILABLE'), name)
+    assert.deepEqual(f.calls.urls, [], `${name}: the URL must not be tried`)
+  }
+})
+
+test('resolveImage: nothing to load -> IMAGE_UNAVAILABLE; missing key and no URL -> IMAGE_UNAVAILABLE', async () => {
+  await assert.rejects(() => resolveImage(null, null, fakes().deps), code('IMAGE_UNAVAILABLE'))
+  await assert.rejects(() => resolveImage('gone', null, fakes().deps), code('IMAGE_UNAVAILABLE'))
+})
+
+test('resolveImage: fetch failures (including SSRF refusals) become IMAGE_UNAVAILABLE and reveal nothing', async () => {
+  for (const err of [new SsrfError('Blocked address 10.0.0.1'), new Error('ECONNRESET')]) {
+    const f = fakes({ urls: { 'https://img.test/a.jpg': err } })
+    await assert.rejects(() => resolveImage(null, 'https://img.test/a.jpg', f.deps), (e) => e instanceof AiError && e.code === 'IMAGE_UNAVAILABLE' && !/10\.0\.0\.1/.test(e.message))
+  }
+})
+
+test('resolveImage: bytes that are not an image are refused from S3 and from the URL; oversized files too', async () => {
+  await assert.rejects(() => resolveImage('k', null, fakes({ s3: { k: HTML } }).deps), code('UNSUPPORTED_IMAGE'))
+  await assert.rejects(() => resolveImage(null, 'https://img.test/h', fakes({ urls: { 'https://img.test/h': HTML } }).deps), code('UNSUPPORTED_IMAGE'))
+  const huge = Buffer.concat([PNG, Buffer.alloc(5 * 1024 * 1024)])
+  await assert.rejects(() => resolveImage('k', null, fakes({ s3: { k: huge } }).deps), code('IMAGES_TOO_LARGE'))
+  await assert.rejects(() => resolveImage(null, 'https://img.test/big', fakes({ urls: { 'https://img.test/big': huge } }).deps), code('IMAGES_TOO_LARGE'))
+})
+
+// ------------------------------------------------------------------------------------------------ getEvidenceImage
+// The service's real loadContext runs against this fake database (two queries: the inspection, then the photo rows).
+function fakeDb({ inspection, photos = [] }) {
+  return {
+    query: async (sql) => {
+      if (/FROM inspections/i.test(sql)) {
+        return { rows: inspection ? [{ id: 9, return_id: 3, customer_image_url: null, product_name: 'Sony', image_key: null, product_image_url: null, ...inspection }] : [] }
+      }
+      return { rows: photos }
+    },
+  }
 }
-
-// ─── safeFetch unit tests ────────────────────────────────────────────────────
-
-// Import directly; no DB involved.
-import { safeFetchImage, SsrfError, FetchError } from '../src/utils/safeFetch.js'
-
-test('safeFetch — rejects non-http schemes', async () => {
-  await assert.rejects(
-    () => safeFetchImage('ftp://example.com/img.jpg'),
-    (err) => err instanceof SsrfError && /Only http/.test(err.message),
-  )
-})
-
-test('safeFetch — rejects localhost', async () => {
-  await assert.rejects(
-    () => safeFetchImage('http://localhost/img.jpg'),
-    (err) => err instanceof SsrfError,
-  )
-})
-
-test('safeFetch — rejects 127.x.x.x loopback', async () => {
-  // IP literal is caught immediately in validateUrlString — no DNS call needed.
-  await assert.rejects(
-    () => safeFetchImage('http://127.0.0.1/img.jpg'),
-    (err) => err instanceof SsrfError,
-  )
-})
-
-test('safeFetch — rejects 10.x private range', async () => {
-  // IP literal is caught immediately in validateUrlString — no DNS call needed.
-  await assert.rejects(
-    () => safeFetchImage('http://10.0.0.1/img.jpg'),
-    (err) => err instanceof SsrfError,
-  )
-})
-
-test('safeFetch — rejects 169.254.169.254 cloud-metadata', async () => {
-  // IP literal is caught immediately in validateUrlString — no DNS call needed.
-  await assert.rejects(
-    () => safeFetchImage('http://169.254.169.254/latest/meta-data'),
-    (err) => err instanceof SsrfError,
-  )
-})
-
-test('safeFetch — rejects 192.168.x private range', async () => {
-  // IP literal is caught immediately in validateUrlString — no DNS call needed.
-  await assert.rejects(
-    () => safeFetchImage('http://192.168.1.1/img.jpg'),
-    (err) => err instanceof SsrfError,
-  )
-})
-
-test('safeFetch — rejects invalid URL', async () => {
-  await assert.rejects(
-    () => safeFetchImage('not-a-url'),
-    (err) => err instanceof SsrfError,
-  )
-})
-
-test('safeFetch — rejects empty string', async () => {
-  await assert.rejects(
-    () => safeFetchImage(''),
-    (err) => err instanceof SsrfError,
-  )
-})
-
-test('safeFetch — rejects non-image content-type from server', async () => {
-  const { server, port } = await startServer((_req, res) => {
-    res.writeHead(200, { 'Content-Type': 'text/html' })
-    res.end('<html>not an image</html>')
-  })
-  try {
-    await assert.rejects(
-      () => safeFetchImage(`http://127.0.0.1:${port}/img`),
-      // The SsrfError is thrown by the IP check BEFORE connecting to 127.0.0.1
-      (err) => err instanceof SsrfError || err instanceof FetchError,
-    )
-  } finally {
-    await stopServer(server)
-  }
-})
-
-// Note: tests that actually reach our local server through safeFetch cannot
-// complete because safeFetch DNS-blocks 127.0.0.1 before connecting.
-// We test the HTTP-layer logic via resolveImage mock tests below.
-
-test('safeFetch — throws FetchError on invalid URL structure (no hostname)', async () => {
-  await assert.rejects(
-    () => safeFetchImage('http:///path'),
-    (err) => err instanceof SsrfError || err instanceof FetchError,
-  )
-})
-
-// ─── resolveImage + getEvidenceImage + runAssessment via mocked dependencies ─
-//
-// We mock pool, storage.service, and safeFetch at the module level using a thin
-// wrapper approach: we test the exported resolveImage behaviour by testing the
-// services that consume it (getEvidenceImage, runAssessment) with controlled
-// fakes injected via module-mock helpers.
-//
-// Because Node's built-in test runner does not provide import-map mocking, we
-// exercise the logic through a lightweight "functional unit" — we extract the
-// image-resolution logic from the service and test it directly.
-
-// ── Recreate resolveImage standalone for unit testing ─────────────────────
-// This mirrors the logic in aiInspection.service.js so we can test it
-// without real S3 / DB / network.
-
-const SIGNATURES_LOCAL = [
-  { type: 'image/jpeg', test: (b) => b.length > 3 && b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff },
-  { type: 'image/png',  test: (b) => b.length > 8 && b.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])) },
-  { type: 'image/webp', test: (b) => b.length > 12 && b.toString('ascii', 0, 4) === 'RIFF' && b.toString('ascii', 8, 12) === 'WEBP' },
-]
-const MAX_IMAGE_BYTES_LOCAL = 5 * 1024 * 1024
-
-class AiErrorLocal extends Error {
-  constructor(code) { super(code); this.code = code }
+const spy = (result = { bytes: PNG, type: 'image/png' }) => {
+  const calls = []
+  return { calls, resolve: async (...a) => { calls.push(a); if (result instanceof Error) throw result; return result } }
 }
+const notFound = (e) => e.code === 'NOT_FOUND'
 
-async function resolveImageUnit(key, fallbackUrl, { getObject, fetchUrl }) {
-  // 1. Try S3
-  if (key) {
-    let object
-    try {
-      object = await getObject(key)
-    } catch (err) {
-      if (err?.name !== 'NoSuchKey') throw new AiErrorLocal('IMAGE_UNAVAILABLE')
-    }
-    if (object) {
-      const real = SIGNATURES_LOCAL.find((s) => s.test(object.body))
-      if (!real) throw new AiErrorLocal('UNSUPPORTED_IMAGE')
-      if (object.body.length > MAX_IMAGE_BYTES_LOCAL) throw new AiErrorLocal('IMAGES_TOO_LARGE')
-      return { bytes: object.body, type: real.type }
-    }
+test('getEvidenceImage(reference): passes the product S3 key first and the product URL as the fallback', async () => {
+  const s = spy()
+  const r = await getEvidenceImage(9, 'reference', undefined, { db: fakeDb({ inspection: { image_key: 'products/x.png', product_image_url: 'https://img.test/p.png' } }), resolve: s.resolve })
+  assert.deepEqual(s.calls, [['products/x.png', 'https://img.test/p.png']])
+  assert.equal(r.type, 'image/png')
+  assert.ok(r.body.equals(PNG))
+})
+
+test('getEvidenceImage(reference): URL-only demo product works; no key and no URL is a 404', async () => {
+  const s = spy()
+  await getEvidenceImage(9, 'reference', undefined, { db: fakeDb({ inspection: { product_image_url: 'https://img.test/p.png' } }), resolve: s.resolve })
+  assert.deepEqual(s.calls, [[null, 'https://img.test/p.png']])
+  await assert.rejects(() => getEvidenceImage(9, 'reference', undefined, { db: fakeDb({ inspection: {} }), resolve: s.resolve }), notFound)
+  assert.equal(s.calls.length, 1, 'nothing is resolved when there is no source')
+})
+
+test('getEvidenceImage(photo): a real return_images row is served by its S3 key, with its stored type', async () => {
+  const s = spy({ bytes: JPG, type: 'image/jpeg' })
+  const db = fakeDb({ inspection: { customer_image_url: 'https://img.test/demo.jpg' }, photos: [{ id: 41, image_key: 'returns/3/a.jpg', image_type: 'image/webp' }] })
+  const r = await getEvidenceImage(9, 'photo', 41, { db, resolve: s.resolve })
+  assert.deepEqual(s.calls, [['returns/3/a.jpg', null]], 'the demo URL is ignored when real photos exist')
+  assert.equal(r.type, 'image/webp')
+})
+
+test('getEvidenceImage(demo-photo): a demo return without return_images serves customer_image_url, only through the explicit kind', async () => {
+  const s = spy()
+  const db = fakeDb({ inspection: { customer_image_url: 'demo-fixture:iphone-16.jpg' } })
+  await getEvidenceImage(9, 'demo-photo', undefined, { db, resolve: s.resolve })
+  assert.deepEqual(s.calls, [[null, 'demo-fixture:iphone-16.jpg']])
+  // the numeric-id route must never reach the sample photo, whatever id (or non-id) is sent
+  for (const bad of [null, undefined, 0, -1, '1', 'null', NaN, 1.5]) await assert.rejects(() => getEvidenceImage(9, 'photo', bad, { db, resolve: s.resolve }), notFound, String(bad))
+  assert.equal(s.calls.length, 1)
+})
+
+test('getEvidenceImage(demo-photo): 404 when the return has real photos, or no sample photo at all', async () => {
+  const s = spy()
+  const withReal = fakeDb({ inspection: { customer_image_url: 'demo-fixture:iphone-16.jpg' }, photos: [{ id: 41, image_key: 'k', image_type: 'image/png' }] })
+  await assert.rejects(() => getEvidenceImage(9, 'demo-photo', undefined, { db: withReal, resolve: s.resolve }), notFound)
+  await assert.rejects(() => getEvidenceImage(9, 'demo-photo', undefined, { db: fakeDb({ inspection: {} }), resolve: s.resolve }), notFound)
+  assert.equal(s.calls.length, 0)
+})
+
+test('getEvidenceImage(photo): an unknown photo id, no photos at all, and an unknown inspection are all 404', async () => {
+  const s = spy()
+  await assert.rejects(() => getEvidenceImage(9, 'photo', 999, { db: fakeDb({ inspection: {}, photos: [{ id: 41, image_key: 'k', image_type: 'image/png' }] }), resolve: s.resolve }), notFound)
+  await assert.rejects(() => getEvidenceImage(9, 'photo', 41, { db: fakeDb({ inspection: {} }), resolve: s.resolve }), notFound)
+  await assert.rejects(() => getEvidenceImage(9, 'photo', 41, { db: fakeDb({ inspection: null }), resolve: s.resolve }), notFound)
+  assert.equal(s.calls.length, 0)
+})
+
+test('getEvidenceImage: a failure while loading the image (S3 error, blocked URL, bad bytes) is a plain 404, never a leak', async () => {
+  const db = fakeDb({ inspection: { image_key: 'k', product_image_url: 'https://img.test/p.png' } })
+  for (const err of [new AiError('IMAGE_UNAVAILABLE'), new AiError('UNSUPPORTED_IMAGE'), new SsrfError('Blocked address')]) {
+    await assert.rejects(() => getEvidenceImage(9, 'reference', undefined, { db, resolve: spy(err).resolve }), notFound)
   }
-  // 2. URL fallback
-  if (fallbackUrl) {
-    let fetched
-    try {
-      fetched = await fetchUrl(fallbackUrl)
-    } catch {
-      throw new AiErrorLocal('IMAGE_UNAVAILABLE')
-    }
-    const real = SIGNATURES_LOCAL.find((s) => s.test(fetched.body))
-    if (!real) throw new AiErrorLocal('UNSUPPORTED_IMAGE')
-    if (fetched.body.length > MAX_IMAGE_BYTES_LOCAL) throw new AiErrorLocal('IMAGES_TOO_LARGE')
-    return { bytes: fetched.body, type: real.type }
-  }
-  throw new AiErrorLocal('IMAGE_UNAVAILABLE')
-}
-
-// ── resolveImage unit tests ─────────────────────────────────────────────────
-
-test('resolveImage — S3 key present: returns S3 object', async () => {
-  const fakeS3 = async (_key) => ({ body: JPEG_1x1 })
-  const result = await resolveImageUnit('some-key', null, { getObject: fakeS3, fetchUrl: null })
-  assert.equal(result.type, 'image/jpeg')
-  assert.deepEqual(result.bytes, JPEG_1x1)
 })
-
-test('resolveImage — S3 key present and S3 returns NoSuchKey: falls back to URL', async () => {
-  const err = new Error('Not found'); err.name = 'NoSuchKey'
-  const fakeS3 = async () => { throw err }
-  const fakeFetch = async (_url) => ({ body: JPEG_1x1, contentType: 'image/jpeg' })
-
-  const result = await resolveImageUnit('dead-key', 'https://example.com/img.jpg', {
-    getObject: fakeS3,
-    fetchUrl: fakeFetch,
-  })
-  assert.equal(result.type, 'image/jpeg')
-})
-
-test('resolveImage — S3 key absent, valid URL: returns fetched image', async () => {
-  const fakeFetch = async (_url) => ({ body: PNG_1x1, contentType: 'image/png' })
-  const result = await resolveImageUnit(null, 'https://example.com/photo.png', {
-    getObject: null,
-    fetchUrl: fakeFetch,
-  })
-  assert.equal(result.type, 'image/png')
-  assert.deepEqual(result.bytes, PNG_1x1)
-})
-
-test('resolveImage — both key and URL absent: throws IMAGE_UNAVAILABLE', async () => {
-  await assert.rejects(
-    () => resolveImageUnit(null, null, { getObject: null, fetchUrl: null }),
-    (err) => err instanceof AiErrorLocal && err.code === 'IMAGE_UNAVAILABLE',
-  )
-})
-
-test('resolveImage — S3 key present, S3 throws non-NoSuchKey error: throws IMAGE_UNAVAILABLE (does not fall back)', async () => {
-  const err = new Error('AccessDenied'); err.name = 'AccessDenied'
-  const fakeS3 = async () => { throw err }
-  await assert.rejects(
-    () => resolveImageUnit('real-key', 'https://example.com/backup.jpg', {
-      getObject: fakeS3,
-      fetchUrl: async () => ({ body: JPEG_1x1 }),
-    }),
-    (err) => err instanceof AiErrorLocal && err.code === 'IMAGE_UNAVAILABLE',
-  )
-})
-
-test('resolveImage — URL fetch returns non-image bytes: throws UNSUPPORTED_IMAGE', async () => {
-  const fakeFetch = async () => ({ body: NOT_AN_IMAGE, contentType: 'image/jpeg' })
-  await assert.rejects(
-    () => resolveImageUnit(null, 'https://example.com/bad.jpg', {
-      getObject: null,
-      fetchUrl: fakeFetch,
-    }),
-    (err) => err instanceof AiErrorLocal && err.code === 'UNSUPPORTED_IMAGE',
-  )
-})
-
-test('resolveImage — URL fetch returns oversized body: throws IMAGES_TOO_LARGE', async () => {
-  const hugeBuf = Buffer.concat([JPEG_1x1, Buffer.alloc(5 * 1024 * 1024 + 1)])
-  const fakeFetch = async () => ({ body: hugeBuf, contentType: 'image/jpeg' })
-  await assert.rejects(
-    () => resolveImageUnit(null, 'https://example.com/huge.jpg', {
-      getObject: null,
-      fetchUrl: fakeFetch,
-    }),
-    (err) => err instanceof AiErrorLocal && err.code === 'IMAGES_TOO_LARGE',
-  )
-})
-
-test('resolveImage — URL fetch throws SsrfError: throws IMAGE_UNAVAILABLE', async () => {
-  const fakeFetch = async () => { throw new SsrfError('Blocked') }
-  await assert.rejects(
-    () => resolveImageUnit(null, 'http://127.0.0.1/img.jpg', {
-      getObject: null,
-      fetchUrl: fakeFetch,
-    }),
-    (err) => err instanceof AiErrorLocal && err.code === 'IMAGE_UNAVAILABLE',
-  )
-})
-
-test('resolveImage — S3 object fails magic-byte check: throws UNSUPPORTED_IMAGE', async () => {
-  const fakeS3 = async () => ({ body: NOT_AN_IMAGE })
-  await assert.rejects(
-    () => resolveImageUnit('key', null, { getObject: fakeS3, fetchUrl: null }),
-    (err) => err instanceof AiErrorLocal && err.code === 'UNSUPPORTED_IMAGE',
-  )
-})
-
-// ── AI-assessment image-loading tests (via resolveImageUnit, mirrors runAssessment logic) ─
-
-test('AI assessment — loads reference and photo from demo URLs when S3 keys absent', async () => {
-  const fakeFetch = async (url) => {
-    if (url.includes('ref')) return { body: JPEG_1x1, contentType: 'image/jpeg' }
-    if (url.includes('photo')) return { body: PNG_1x1,  contentType: 'image/png'  }
-    throw new FetchError('unexpected URL')
-  }
-  const reference = await resolveImageUnit(null, 'https://example.com/ref.jpg',  { getObject: null, fetchUrl: fakeFetch })
-  const photo     = await resolveImageUnit(null, 'https://example.com/photo.png', { getObject: null, fetchUrl: fakeFetch })
-  assert.equal(reference.type, 'image/jpeg')
-  assert.equal(photo.type,     'image/png')
-})
-
-test('AI assessment — S3 key takes precedence over demo URL', async () => {
-  let urlFetchCalled = false
-  const fakeS3    = async () => ({ body: JPEG_1x1 })
-  const fakeFetch = async () => { urlFetchCalled = true; return { body: PNG_1x1 } }
-  const result = await resolveImageUnit('valid-key', 'https://example.com/fallback.jpg', {
-    getObject: fakeS3,
-    fetchUrl: fakeFetch,
-  })
-  assert.equal(urlFetchCalled, false, 'URL fetch should not be called when S3 key succeeds')
-  assert.equal(result.type, 'image/jpeg')
-})
-
-// ── getEvidenceImage behaviour tests (via a thin wrapper that substitutes resolveImage) ─
-
-// We test getEvidenceImage's routing logic separately to avoid the real pool.
-// getEvidenceImage does: loadContext → pick key/url → resolveImage → return {body, type}
-// We replicate its conditional logic here with injected ctx.
-
-function fakeGetEvidenceImage(ctx, kind, imageId, resolveImageFn) {
-  let key, fallbackUrl, storedType
-  if (kind === 'reference') {
-    key = ctx.image_key
-    fallbackUrl = ctx.product_image_url
-    if (!key && !fallbackUrl) { const e = new Error('Image not found.'); e.code = 'NOT_FOUND'; throw e }
-  } else {
-    const photo = imageId != null
-      ? ctx.photos.find((p) => p.id === imageId)
-      : ctx.photos.find((p) => p.id === null)
-    if (!photo) { const e = new Error('Image not found.'); e.code = 'NOT_FOUND'; throw e }
-    key = photo.image_key
-    fallbackUrl = photo.image_url
-    storedType = photo.image_type
-    if (!key && !fallbackUrl) { const e = new Error('Image not found.'); e.code = 'NOT_FOUND'; throw e }
-  }
-  return resolveImageFn(key, fallbackUrl).then((result) => ({
-    body: result.bytes,
-    type: storedType ?? result.type,
-  }))
-}
-
-test('getEvidenceImage — reference: S3 key present, returns S3 image', async () => {
-  const ctx = { image_key: 's3-key', product_image_url: null, photos: [] }
-  const fakeFetch = async () => ({ body: JPEG_1x1, contentType: 'image/jpeg' })
-  const result = await fakeGetEvidenceImage(ctx, 'reference', null,
-    (key, url) => resolveImageUnit(key, url, {
-      getObject: async () => ({ body: JPEG_1x1 }),
-      fetchUrl: fakeFetch,
-    }),
-  )
-  assert.equal(result.type, 'image/jpeg')
-})
-
-test('getEvidenceImage — reference: no S3 key, falls back to product_image_url', async () => {
-  const ctx = { image_key: null, product_image_url: 'https://example.com/product.jpg', photos: [] }
-  const result = await fakeGetEvidenceImage(ctx, 'reference', null,
-    (key, url) => resolveImageUnit(key, url, {
-      getObject: null,
-      fetchUrl: async () => ({ body: JPEG_1x1 }),
-    }),
-  )
-  assert.equal(result.type, 'image/jpeg')
-})
-
-test('getEvidenceImage — reference: no key and no URL, throws NOT_FOUND', async () => {
-  const ctx = { image_key: null, product_image_url: null, photos: [] }
-  await assert.rejects(
-    () => fakeGetEvidenceImage(ctx, 'reference', null, () => {}),
-    (err) => err.code === 'NOT_FOUND',
-  )
-})
-
-test('getEvidenceImage — photo: real return_images row found, uses image_key', async () => {
-  const ctx = {
-    image_key: 'ref-key',
-    product_image_url: null,
-    photos: [{ id: 42, image_key: 'photo-s3-key', image_url: null, image_type: 'image/jpeg' }],
-  }
-  const result = await fakeGetEvidenceImage(ctx, 'photo', 42,
-    (key, url) => resolveImageUnit(key, url, {
-      getObject: async () => ({ body: JPEG_1x1 }),
-      fetchUrl: null,
-    }),
-  )
-  assert.equal(result.type, 'image/jpeg')
-})
-
-test('getEvidenceImage — photo: synthetic demo photo (id=null), uses customer_image_url', async () => {
-  const ctx = {
-    image_key: null,
-    product_image_url: 'https://example.com/ref.jpg',
-    photos: [{ id: null, image_key: null, image_url: 'https://example.com/return-photo.jpg', image_type: null }],
-  }
-  // imageId is null → finds the synthetic photo
-  const result = await fakeGetEvidenceImage(ctx, 'photo', null,
-    (key, url) => resolveImageUnit(key, url, {
-      getObject: null,
-      fetchUrl: async () => ({ body: PNG_1x1 }),
-    }),
-  )
-  assert.equal(result.type, 'image/png')
-})
-
-test('getEvidenceImage — photo: no image row at all, throws NOT_FOUND', async () => {
-  const ctx = { image_key: null, product_image_url: null, photos: [] }
-  await assert.rejects(
-    () => fakeGetEvidenceImage(ctx, 'photo', 99, () => {}),
-    (err) => err.code === 'NOT_FOUND',
-  )
-})
-
-// ── safeFetch redirect handling ──────────────────────────────────────────────
-// We cannot test a successful redirect through safeFetch because it blocks
-// 127.0.0.1. Instead we verify that the redirect-loop guard throws a FetchError.
-
-test('safeFetch — rejects redirect to blocked host', async () => {
-  // Attempting to follow a redirect to 127.0.0.1 should be blocked because
-  // the redirect target is a loopback address. Since safeFetch blocks 127.0.0.1
-  // at URL-validation time, we verify this with a direct call.
-  await assert.rejects(
-    () => safeFetchImage('http://127.0.0.1/redirect'),
-    (err) => err instanceof SsrfError,
-  )
-})
-
-// ── summary ──────────────────────────────────────────────────────────────────
-// All tests above run fully in-process with no real DB, network, or S3 calls.
-// The shared pool is intentionally NOT closed here so other test files are not
-// affected when this file is run as part of the full test suite.

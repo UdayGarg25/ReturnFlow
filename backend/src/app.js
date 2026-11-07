@@ -1,7 +1,7 @@
 import express from 'express';
 import cors from 'cors';
 import cookieParser from 'cookie-parser';
-import { getReadinessStatus } from './health/readiness.js';
+import { canSeeReadinessDetail, getReadinessStatus, publicReadinessBody } from './health/readiness.js';
 import adminRoutes from './routes/admin.routes.js';
 import demoRoutes from './routes/demo.routes.js';
 import devAiTestRoutes from './routes/devAiTest.routes.js';
@@ -14,11 +14,21 @@ import sellerRoutes from './routes/seller.routes.js';
 import warehouseRoutes from './routes/warehouse.routes.js';
 import productRoutes from './routes/product.routes.js';
 import { apiLimiter } from './middleware/rateLimit.middleware.js';
+import { parseTrustProxy } from './config/trustProxy.js';
 
 const app = express();
+app.disable('x-powered-by'); // do not advertise the framework
 
-if (process.env.TRUST_PROXY) {
-  app.set('trust proxy', process.env.TRUST_PROXY === 'true' ? true : process.env.TRUST_PROXY);
+// Minimal response hardening for a JSON API (the images streamed by the backend already set their own headers).
+app.use((req, res, next) => {
+  res.set('X-Content-Type-Options', 'nosniff');
+  next();
+});
+
+const trustProxy = parseTrustProxy(process.env.TRUST_PROXY);
+if (trustProxy !== false) app.set('trust proxy', trustProxy);
+else if (process.env.NODE_ENV === 'production') {
+  console.warn('TRUST_PROXY is not set. Behind a reverse proxy (Render, Nginx) every user would share the proxy IP for rate limiting: set TRUST_PROXY to the number of proxies (usually 1).');
 }
 
 // Browser origins allowed to call the API WITH cookies. Credentialed requests can
@@ -45,7 +55,8 @@ app.get('/health', (req, res) => {
 
 app.get('/health/ready', async (req, res) => {
   const readiness = await getReadinessStatus();
-  res.status(readiness.httpStatus).json(readiness.body);
+  const detailed = await canSeeReadinessDetail(req); // admin session or X-Health-Token; everyone else gets only the status
+  res.status(readiness.httpStatus).json(detailed ? readiness.body : publicReadinessBody(readiness.body));
 });
 
 // Global rate limiting for API routes (health checks are mounted above and exempt)

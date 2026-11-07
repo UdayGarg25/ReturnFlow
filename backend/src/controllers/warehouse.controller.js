@@ -15,4 +15,5 @@ export const retryAiAssessment = handle(async (req) => ({ status: 202, body: { a
 // The evidence images, streamed through the backend (the bucket is private; no keys or URLs reach the browser).
 const noStoreImage = (file) => ({ body: file.body, headers: { 'Content-Type': file.type, 'Content-Disposition': 'inline', 'X-Content-Type-Options': 'nosniff', 'Cache-Control': 'private, max-age=300', Vary: 'Cookie' } })
 export const referenceImage = handleFile(async (req) => noStoreImage(await ai.getEvidenceImage(parseId(req.params.id, 'Inspection'), 'reference')))
+export const demoPhoto = handleFile(async (req) => noStoreImage(await ai.getEvidenceImage(parseId(req.params.id, 'Inspection'), 'demo-photo')))
 export const returnPhoto = handleFile(async (req) => noStoreImage(await ai.getEvidenceImage(parseId(req.params.id, 'Inspection'), 'photo', parseId(req.params.imageId, 'Image'))))

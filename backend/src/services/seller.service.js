@@ -3,6 +3,7 @@ import { getSellerSummary } from './aiInspection.service.js'
 import { defaultPickupAgent } from './assignment.js'
 import { conflict, notFound, validationError } from '../utils/http.js'
 import { cacheService } from './cache.service.js'
+import { sellerImageUrlProblem } from '../utils/imageUrl.js'
 import { invalidateCatalogCache } from './product.service.js'
 
 // Every query is scoped to the logged-in seller (sellerId comes from req.user).
@@ -15,7 +16,7 @@ const PG_REFERENCED = ['23001', '23503']
 // ------------------------------------------------------------------ products ----
 const PRODUCT_COLUMNS = 'id, name, description, price, image_url, created_at, updated_at'
 
-function validateProduct(input) {
+export function validateProduct(input) {
   const { name, description, price, imageUrl } = input ?? {}
   const fieldErrors = {}
 
@@ -28,15 +29,10 @@ function validateProduct(input) {
   if (typeof priceText !== 'string' || !/^\d{1,10}(\.\d{1,2})?$/.test(priceText.trim())) fieldErrors.price = 'Enter a valid price, e.g. 120 or 99.50.'
 
   if (imageUrl !== undefined && imageUrl !== null && imageUrl !== '') {
-    let ok = typeof imageUrl === 'string' && imageUrl.length <= 500
-    if (ok) {
-      try {
-        ok = ['http:', 'https:'].includes(new URL(imageUrl).protocol)
-      } catch {
-        ok = false
-      }
-    }
-    if (!ok) fieldErrors.imageUrl = 'Image URL must be a valid http(s) address.'
+    // https only, public domain names only. The backend may later fetch this URL (as the reference image in a warehouse
+    // inspection); that fetch is re-validated by safeFetchImage, this is just the early, friendly check.
+    const problem = sellerImageUrlProblem(imageUrl)
+    if (problem) fieldErrors.imageUrl = problem
   }
 
   if (Object.keys(fieldErrors).length > 0) throw validationError('Invalid product.', fieldErrors)

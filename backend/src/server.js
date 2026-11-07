@@ -3,6 +3,7 @@ import http from 'http';
 import { fileURLToPath } from 'url';
 import app from './app.js';
 import pool from './config/db.js';
+import { describeDatabaseTarget, isLocalDatabase } from './config/dbConfig.js';
 import { closeRedis, initializeRedis } from './config/redis.js';
 import { createGracefulShutdown } from './lifecycle/gracefulShutdown.js';
 
@@ -33,6 +34,12 @@ export async function startServer({
 
     const result = await Promise.race([pgPool.query('SELECT NOW()'), timeoutPromise]);
     logger.log('Database connected:', result.rows?.[0] || 'ok');
+    // Which database is this? (host:port/name only, never credentials.) Lets an operator confirm the public demo runs on its own
+    // dedicated database and not on a development one.
+    logger.log(`Database target: ${describeDatabaseTarget()}`);
+    if (/^true$/i.test(process.env.DEMO_ENABLED?.trim() ?? '') && process.env.NODE_ENV === 'production' && isLocalDatabase()) {
+      logger.warn?.('DEMO_ENABLED=true in production but the database is on this machine. The public demo should use its own dedicated database (see backend/.env.example).');
+    }
   } catch (error) {
     logger.error('Database connection failed:', error.message);
     throw new Error(`Database connection failed: ${error.message}`);

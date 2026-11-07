@@ -4,7 +4,7 @@
 // the real private S3 bucket (the product reference image + temporary customer photos), starts the backend on a spare
 // port, and puts everything back afterwards (guided demo order reset, temp user removed, S3 test objects deleted).
 import assert from 'node:assert/strict'
-import { spawn } from 'node:child_process'
+import { execFileSync, spawn } from 'node:child_process'
 import { createServer } from 'node:http'
 import { readFileSync } from 'node:fs'
 import path from 'node:path'
@@ -55,6 +55,13 @@ const mock = createServer((req, res) => {
       case 'too-long': return completion(JSON.stringify(validResult({ summary: 'x'.repeat(5000) })))
       case 'workflow': return completion(JSON.stringify({ ...validResult(), action: 'approve_return', sql: 'UPDATE refunds SET status=\'COMPLETED\'' }))
       case 'empty': return completion('')
+      // the real provider shape seen live: no content, only reasoning, finish_reason "content_filter"
+      case 'filter-always': return completion(null, 'content_filter', { reasoning: 'x'.repeat(2000) })
+      // blocks only while the customer's free text is in the request, like the live case
+      case 'filter-on-description': {
+        const sent = JSON.stringify(body.messages)
+        return sent.includes('Left ear cup scratched') ? completion(null, 'content_filter', { reasoning: 'x'.repeat(2000) }) : completion(JSON.stringify(validResult()))
+      }
       case 'truncated': return completion('{"schemaVersion":1,', 'length')
       case 'refusal': return completion(null, 'stop', { refusal: 'I cannot help with that.' })
       case 'rate-limit': return reply(429, { error: { message: 'PROVIDER-INTERNAL rate limited, key sk-or-secret-123', code: 429 } })
@@ -89,7 +96,13 @@ const photo = (who, rid, buf) => { const f = new FormData(); f.append('image', n
 const exists = async (key) => { try { await s3.send(new HeadObjectCommand({ Bucket: S3_BUCKET, Key: key })); return true } catch (e) { if (e.$metadata?.httpStatusCode === 404 || e.name === 'NotFound') return false; throw e } }
 
 let backend, noKey, tempStaff, rid, insp
+const noRef = {} // ids of the dedicated "no reference image" fixture, removed again in cleanup
 const cleanup = async () => {
+  if (noRef.rid) {
+    for (const sql of ['DELETE FROM refunds WHERE return_request_id = $1', 'DELETE FROM inspections WHERE return_request_id = $1', 'DELETE FROM pickup_assignments WHERE return_request_id = $1', 'DELETE FROM return_requests WHERE id = $1']) await pool.query(sql, [noRef.rid]).catch(() => {})
+  }
+  if (noRef.order) { await pool.query('DELETE FROM order_items WHERE order_id = $1', [noRef.order]).catch(() => {}); await pool.query('DELETE FROM orders WHERE id = $1', [noRef.order]).catch(() => {}) }
+  if (noRef.product) await pool.query('DELETE FROM products WHERE id = $1', [noRef.product]).catch(() => {})
   try { await call(API, await login('alice@returnflow.test'), 'POST', '/api/demo/reset') } catch { /* server may be down */ }
   if (tempStaff) await pool.query('DELETE FROM users WHERE id = $1', [tempStaff]).catch(() => {})
   mock.close()
@@ -135,10 +148,25 @@ try {
 
   // ============================================================================ not startable: missing evidence / config
   let r = await call(API, wendy, 'GET', base); assert.equal(r.j.assessment.status, 'NOT_STARTED'); assert.equal(r.j.assessment.unavailable.code, 'NO_RETURN_PHOTOS')
-  r = await call(API, wendy, 'POST', base); assert.equal(r.s, 409); assert.match(r.j.message, /did not upload any photos/); noRequestsSent(); assert.equal((await q('SELECT COUNT(*)::int c FROM ai_assessments'))[0].c, 0)
+  r = await call(API, wendy, 'POST', base); assert.equal(r.s, 409); assert.match(r.j.message, /did not upload any photos/); noRequestsSent(); assert.equal((await q('SELECT COUNT(*)::int c FROM ai_assessments WHERE inspection_id = $1', [insp]))[0].c, 0)
   ok('no customer photos -> the assessment cannot start (409, plain message), no model request is sent, no fabricated result is stored')
-  const other = (await q(`SELECT i.id FROM inspections i JOIN return_requests rr ON rr.id = i.return_request_id JOIN products p ON p.id = rr.product_id WHERE p.image_key IS NULL AND i.status IN ('PENDING','IN_PROGRESS','MANUAL_REVIEW') AND i.warehouse_staff_id = (SELECT id FROM users WHERE email = 'wendy@returnflow.test') LIMIT 1`))[0]
-  if (other) { r = await call(API, wendy, 'POST', `/api/warehouse/inspections/${other.id}/ai-assessment`); assert.equal(r.s, 409); assert.match(r.j.message, /no reference image/); ok('a product without a reference image -> 409 "no reference image", nothing sent to the model') }
+  // Dedicated fixture (not borrowed from seed data, which now has pictures for most products): a [TEST] product with NO reference
+  // image at all (no S3 key and no URL), returned by Alice and walked through the real workflow to Wendy's inspection queue.
+  noRef.product = (await q(`INSERT INTO products (seller_id, name, description, price) VALUES ((SELECT id FROM users WHERE email = 'sam@returnflow.test'), '[TEST] Product without a reference image', 'AI test fixture', 10) RETURNING id`))[0].id
+  noRef.order = (await q(`INSERT INTO orders (customer_id, status, total_amount) VALUES ((SELECT id FROM users WHERE email = 'alice@returnflow.test'), 'DELIVERED', 10) RETURNING id`))[0].id
+  const noRefItem = (await q(`INSERT INTO order_items (order_id, product_id, quantity, unit_price) VALUES ($1, $2, 1, 10) RETURNING id`, [noRef.order, noRef.product]))[0].id
+  noRef.rid = (await call(API, alice, 'POST', '/api/customer/returns', { orderItemId: noRefItem, reason: 'DAMAGED', description: '[TEST] no reference image fixture' })).j.return.id
+  assert.equal((await call(API, sam, 'POST', `/api/seller/returns/${noRef.rid}/decision`, { decision: 'approve' })).s, 200)
+  const noRefPickup = (await call(API, pete, 'GET', '/api/pickups')).j.pickups.find((p) => p.return_request_id === noRef.rid).id
+  assert.equal((await call(API, pete, 'POST', `/api/pickups/${noRefPickup}/status`, { status: 'ACCEPTED' })).s, 200)
+  assert.equal((await call(API, pete, 'POST', `/api/pickups/${noRefPickup}/status`, { status: 'PICKED_UP' })).s, 200)
+  const noRefInspection = (await q('SELECT id FROM inspections WHERE return_request_id = $1', [noRef.rid]))[0].id
+  const noRefState = (await call(API, wendy, 'GET', `/api/warehouse/inspections/${noRefInspection}/ai-assessment`)).j.assessment
+  assert.equal(noRefState.unavailable.code, 'NO_REFERENCE_IMAGE'); assert.equal(noRefState.evidence.hasReference, false)
+  r = await call(API, wendy, 'POST', `/api/warehouse/inspections/${noRefInspection}/ai-assessment`)
+  assert.equal(r.s, 409); assert.match(r.j.message, /no reference image/i); noRequestsSent()
+  assert.equal((await q('SELECT COUNT(*)::int c FROM ai_assessments WHERE inspection_id = $1', [noRefInspection]))[0].c, 0)
+  ok('a product without a reference image (dedicated fixture) -> 409 "no reference image", nothing sent to the model, nothing stored')
   const nk = await call(`http://localhost:${NOKEY_PORT}`, await (async () => { const x = await call(`http://localhost:${NOKEY_PORT}`, null, 'POST', '/api/auth/login', { email: 'wendy@returnflow.test', password: 'Password123!' }); return { c: x.h.getSetCookie()[0].split(';')[0] } })(), 'GET', base)
   assert.equal(nk.s, 200); assert.equal(nk.j.assessment.unavailable.code, 'NOT_CONFIGURED'); ok('with no API key the inspection screen data still loads and says AI is not configured (manual inspection stays possible)')
   // upload the temporary customer photos straight into the bucket + table (fixtures; the return is past the upload window)
@@ -178,7 +206,7 @@ try {
   assert.equal((await call(API, wendy, 'GET', `/api/warehouse/inspections/${insp}/evidence/photos/999999`)).s, 404); assert.equal((await call(API, alice, 'GET', `/api/warehouse/inspections/${insp}/evidence/photos/${done.evidence.photos[0].id}`)).s, 403); ok('warehouse evidence images stream through the backend (reference + photos, private cache headers); wrong id 404; customers 403')
 
   // ===================================================================== failures: safe codes, retry, never fabricated
-  const failureCases = [['not-json', 'INVALID_RESPONSE'], ['missing-field', 'INVALID_RESPONSE'], ['bad-enum', 'INVALID_RESPONSE'], ['too-long', 'INVALID_RESPONSE'], ['workflow', 'INVALID_RESPONSE'], ['empty', 'EMPTY_RESPONSE'], ['truncated', 'TRUNCATED'], ['refusal', 'REFUSED'], ['rate-limit', 'RATE_LIMITED'], ['server-error', 'PROVIDER_UNAVAILABLE'], ['auth-error', 'AUTH_FAILED'], ['image-error', 'UNSUPPORTED_IMAGE'], ['drop', 'PROVIDER_UNAVAILABLE']]
+  const failureCases = [['not-json', 'INVALID_RESPONSE'], ['missing-field', 'INVALID_RESPONSE'], ['bad-enum', 'INVALID_RESPONSE'], ['too-long', 'INVALID_RESPONSE'], ['workflow', 'INVALID_RESPONSE'], ['empty', 'EMPTY_RESPONSE'], ['filter-always', 'CONTENT_FILTERED'], ['truncated', 'TRUNCATED'], ['refusal', 'REFUSED'], ['rate-limit', 'RATE_LIMITED'], ['server-error', 'PROVIDER_UNAVAILABLE'], ['auth-error', 'AUTH_FAILED'], ['image-error', 'UNSUPPORTED_IMAGE'], ['drop', 'PROVIDER_UNAVAILABLE']]
   for (const [kind, code] of failureCases) {
     await reset(); behavior = { kind }
     assert.equal((await call(API, wendy, 'POST', base)).s, 202)
@@ -190,6 +218,20 @@ try {
   // retry
   behavior = { kind: 'inconclusive' }; assert.equal((await call(API, wendy, 'POST', `${base}/retry`)).s, 202); let a = await poll()
   assert.equal(a.status, 'COMPLETED'); assert.equal(a.attempts, 2); assert.equal(a.result.manualReviewRequired, true); assert.equal(a.result.productMatch.status, 'inconclusive'); ok('a failed assessment can be retried (attempt 2); an uncertain answer is stored with manualReviewRequired forced to true')
+  // provider safety filter: reported as such (not as "no answer"); when only the free text triggers it, ONE retry without it
+  await reset(); behavior = { kind: 'filter-on-description' }; calls.length = 0
+  assert.equal((await call(API, wendy, 'POST', base)).s, 202); a = await poll()
+  assert.equal(a.status, 'COMPLETED'); assert.equal(calls.length, 2, 'exactly one extra attempt')
+  assert.ok(JSON.stringify(calls[0].body.messages).includes('Left ear cup scratched')); assert.ok(!JSON.stringify(calls[1].body.messages).includes('Left ear cup scratched'), 'the retry omits the customer description')
+  assert.ok(JSON.stringify(calls[1].body.messages).includes('DAMAGED'), 'the structured reason code is still sent')
+  assert.ok(a.result.limitations.some((l) => /description text was not sent/.test(l)), 'the result says what was left out'); assert.equal(a.result.manualReviewRequired, true)
+  ok('provider content filter caused by the customer free text: one retry without it succeeds, the saved result states the omission')
+  await reset(); behavior = { kind: 'filter-always' }; calls.length = 0
+  assert.equal((await call(API, wendy, 'POST', base)).s, 202); a = await poll()
+  assert.equal(a.status, 'FAILED'); assert.equal(a.error.code, 'CONTENT_FILTERED'); assert.match(a.error.message, /safety filter/); assert.doesNotMatch(a.error.message, /no answer/); assert.equal(a.result, null); assert.equal(calls.length, 2, 'one retry, then it stops')
+  await reset(); behavior = { kind: 'rate-limit' }; calls.length = 0
+  assert.equal((await call(API, wendy, 'POST', base)).s, 202); a = await poll(); assert.equal(a.error.code, 'RATE_LIMITED'); assert.equal(calls.length, 1, 'a rate limit is never retried automatically')
+  ok('a filtered answer is reported as "blocked by the safety filter" (not "no answer"), stops after one retry, and rate limits are not retried')
   await reset(); behavior = { kind: 'fenced' }; assert.equal((await call(API, wendy, 'POST', base)).s, 202); assert.equal((await poll()).status, 'COMPLETED'); ok('a valid answer wrapped in a ```json fence is accepted after validation')
   assert.equal((await call(API, wendy, 'POST', `${base}/retry`)).s, 409); ok('retry is refused unless the last attempt failed')
 
@@ -208,6 +250,52 @@ try {
   await reset(); await deleteObject(keys[1]); behavior = { kind: 'valid' }; calls.length = 0
   assert.equal((await call(API, wendy, 'POST', base)).s, 202); a = await poll(); assert.equal(a.status, 'FAILED'); assert.equal(a.error.code, 'IMAGE_UNAVAILABLE'); noRequestsSent(); ok('a customer photo that is gone from storage -> FAILED "image unavailable", nothing is sent to the model')
   await uploadObject({ key: keys[1], body: PNG(2), contentType: 'image/png' }); await pool.query('UPDATE return_images SET image_type = image_type WHERE image_key = $1', [keys[1]])
+
+  // ========================================================= Redis connected / down / restarted (real Redis container)
+  // The AI assessment must work in all three states: Redis only adds a lock and shared rate limiting on top of the PostgreSQL claim.
+  const REDIS_CONTAINER = process.env.REDIS_TEST_CONTAINER || 'rf-redis-test'
+  const dockerCli = (...a) => execFileSync('docker', a, { stdio: 'pipe' }).toString().trim()
+  let redisAvailable = true
+  try { dockerCli('exec', REDIS_CONTAINER, 'redis-cli', 'ping') } catch { redisAvailable = false }
+  if (!redisAvailable) {
+    console.log(`SKIPPED: Redis up/down/restart checks (container "${REDIS_CONTAINER}" is not running; see tests/redis-real.integration.test.js)`)
+  } else {
+    const RAPI = 'http://localhost:5087'; const HEALTH = 'ai-redis-matrix-health-token'
+    const rb = startBackend(5087, { REDIS_URL: 'redis://127.0.0.1:6390', REDIS_MAX_BACKOFF_MS: '500', REDIS_STARTUP_WAIT_MS: '1500', REDIS_COMMAND_TIMEOUT_MS: '400', REDIS_SOCKET_TIMEOUT_MS: '2000', HEALTH_CHECK_TOKEN: HEALTH, OPENROUTER_API_KEY: TEST_KEY, OPENROUTER_SERVER_URL: `http://localhost:${MOCK_PORT}` })
+    try {
+      await waitUp(rb)
+      const lr = await call(RAPI, null, 'POST', '/api/auth/login', { email: 'wendy@returnflow.test', password: 'Password123!' }); const rw = { c: lr.h.getSetCookie()[0].split(';')[0] }
+      const redisState = async () => { const r = await fetch(`${RAPI}/health/ready`, { headers: { 'X-Health-Token': HEALTH } }); return (await r.json()).dependencies.redis.status }
+      const until = async (want, ms) => { const end = Date.now() + ms; while (Date.now() < end) { if ((await redisState()) === want) return; await sleep(150) } throw new Error(`Redis never became ${want}`) }
+      const rpoll = async () => { for (let i = 0; i < 100; i++) { const x = (await call(RAPI, rw, 'GET', base)).j.assessment; if (x.status !== 'RUNNING') return x; await sleep(150) } throw new Error('still RUNNING') }
+      const locks = () => dockerCli('exec', REDIS_CONTAINER, 'redis-cli', '--scan', '--pattern', 'rf:lock:*')
+
+      // A. Redis connected
+      await until('up', 15_000); await reset(); behavior = { kind: 'valid' }; calls.length = 0
+      let start = await call(RAPI, rw, 'POST', base); assert.equal(start.s, 202); assert.equal(start.h.get('x-ratelimit-fallback'), null, 'Redis rate limiter in use'); a = await rpoll()
+      assert.equal(a.status, 'COMPLETED'); assert.equal(calls.length, 1); assert.ok(!rb.log.includes('Redis lock unavailable'), 'the lock was taken'); assert.equal(locks(), '', 'and released')
+      assert.deepEqual(await state(), lifecycleBefore)
+      ok('Redis CONNECTED: assessment 202 -> COMPLETED, one provider request, Redis rate limiter and lock used and released, return/inspection/refund untouched')
+
+      // B. Redis down
+      dockerCli('stop', REDIS_CONTAINER); await until('down', 15_000); await reset(); behavior = { kind: 'valid' }; calls.length = 0
+      start = await call(RAPI, rw, 'POST', base); assert.equal(start.s, 202); assert.equal(start.h.get('x-ratelimit-fallback'), 'local-memory', 'per-process rate limiting while Redis is down'); a = await rpoll()
+      assert.equal(a.status, 'COMPLETED'); assert.equal(calls.length, 1); assert.ok(rb.log.includes('Proceeding with database-level protection only'))
+      assert.equal((await q('SELECT status FROM ai_assessments WHERE inspection_id = $1', [insp]))[0].status, 'COMPLETED'); assert.deepEqual(await state(), lifecycleBefore)
+      await reset(); behavior = { kind: 'valid', delayMs: 600 }; calls.length = 0
+      const outageBurst = (await Promise.all([1, 2, 3, 4].map(() => call(RAPI, rw, 'POST', base)))).map((x) => x.s).sort(); assert.deepEqual(outageBurst, [202, 409, 409, 409], 'PostgreSQL alone still allows exactly one'); await rpoll(); assert.equal(calls.length, 1)
+      ok('Redis DOWN: the assessment still completes and is saved (lock bypassed, per-process rate limit, PostgreSQL claim still allows exactly one of 4 simultaneous starts)')
+
+      // C. Redis restarted
+      dockerCli('start', REDIS_CONTAINER); await until('up', 30_000); await reset(); behavior = { kind: 'valid' }; calls.length = 0
+      start = await call(RAPI, rw, 'POST', base); assert.equal(start.s, 202); assert.equal(start.h.get('x-ratelimit-fallback'), null); a = await rpoll()
+      assert.equal(a.status, 'COMPLETED'); assert.equal(calls.length, 1); assert.ok(rb.log.includes('Redis reconnected'))
+      ok('Redis RESTARTED: the backend reconnects by itself and the next assessment is back on the Redis lock and limiter')
+    } finally {
+      try { dockerCli('start', REDIS_CONTAINER) } catch { /* already running */ }
+      spawn('taskkill', ['/pid', String(rb.pid), '/T', '/F'])
+    }
+  }
 
   // =========================================================== the human decision is untouched and AI never decides
   await reset(); behavior = { kind: 'valid' }; assert.equal((await call(API, wendy, 'POST', base)).s, 202); await poll()

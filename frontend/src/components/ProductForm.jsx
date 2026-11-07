@@ -17,11 +17,11 @@ function validate(v) {
   if (v.imageUrl.trim()) {
     let ok = v.imageUrl.length <= 500
     try {
-      ok = ok && ['http:', 'https:'].includes(new URL(v.imageUrl.trim()).protocol)
+      ok = ok && new URL(v.imageUrl.trim()).protocol === 'https:'
     } catch {
       ok = false
     }
-    if (!ok) errors.imageUrl = 'Image URL must be a valid http(s) address.'
+    if (!ok) errors.imageUrl = 'Image URL must be a valid https:// address.'
   }
   return errors
 }

@@ -41,8 +41,15 @@ function Evidence({ inspectionId, evidence }) {
           <figure className="min-w-0"><div className={tile}><div className="flex h-full items-center justify-center p-2 text-center text-xs text-slate-500">No customer photos</div></div><figcaption className="mt-1 text-xs text-slate-500">Customer photos</figcaption></figure>
         )}
         {evidence.photos.map((p, i) => (
-          <figure key={p.id} className="min-w-0">
-            <div className={tile}><PrivateImage cacheKey={`photo-${inspectionId}-${p.id}`} load={(signal) => fetchEvidenceBlob(inspectionId, 'photo', { signal, imageId: p.id })} alt={`Customer photo ${i + 1}`} /></div>
+          <figure key={p.demo ? 'demo' : p.id} className="min-w-0">
+            <div className={tile}>
+              {/* demo returns keep their sample photo outside return_images and are served by an explicit route */}
+              <PrivateImage
+                cacheKey={`photo-${inspectionId}-${p.demo ? 'demo' : p.id}`}
+                load={(signal) => (p.demo ? fetchEvidenceBlob(inspectionId, 'demo-photo', { signal }) : fetchEvidenceBlob(inspectionId, 'photo', { signal, imageId: p.id }))}
+                alt={`Customer photo ${i + 1}`}
+              />
+            </div>
             <figcaption className="mt-1 text-xs text-slate-500">Customer photo {i + 1}</figcaption>
           </figure>
         ))}

@@ -119,6 +119,8 @@ export async function createInvitations(adminId, { role, emails, message }) {
 async function deliver(message) {
   try {
     const result = await sendInvitationEmail(message)
+    // Demo mode: the email service refused to send. Say so plainly (the UI shows emailError next to the address).
+    if (result.blocked) return { emailed: false, emailError: 'Email sending is turned off in demo mode. No email was sent.' }
     return { emailed: true, ...(isDevEmail && { devLink: result.link }) }
   } catch {
     return { emailed: false, emailError: 'The email could not be sent. Use the Resend action to try again.' }

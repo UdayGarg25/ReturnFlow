@@ -1,41 +1,43 @@
 /**
- * safeFetch.js — SSRF-safe external image fetcher
+ * safeFetch.js - SSRF-safe external image fetcher.
  *
- * Used only as a demo-data fallback when no S3 image key is present.
- * Design goals:
- *   1. Allow only http/https, reject every other scheme.
- *   2. Resolve the hostname to an IP before connecting and reject private/
- *      link-local/loopback/cloud-metadata ranges for BOTH IPv4 and IPv6.
- *   3. Follow at most one redirect; validate the redirect target with the same rules.
- *   4. Enforce a strict connect + response-header timeout (5 s).
- *   5. Enforce a hard response-body size limit (MAX_IMAGE_BYTES = 5 MB).
- *   6. Validate the response Content-Type against a known image MIME allowlist.
- *   7. Verify the response body magic bytes against known image signatures.
- *   8. Never expose the original error details to the caller.
+ * Used only as a fallback when an image has no S3 key (demo data, and seller-supplied product image URLs). The URL
+ * may be attacker-influenced (a seller types it), so every hop is checked:
+ *   1. Only https (every hop, redirects included), no credentials in the URL, no "localhost" names.
+ *   2. The connection is made to an address WE validated: a custom `lookup` resolves the name, checks EVERY returned
+ *      address and hands only those to the socket. There is no second, unchecked resolution (no DNS-rebinding window),
+ *      and the Host header / TLS server name / certificate check still use the real hostname.
+ *   3. Addresses are parsed by node:net (BlockList), not by string prefixes. IPv4-mapped IPv6 (::ffff:a.b.c.d or its
+ *      hex form), NAT64, 6to4, Teredo and everything outside global unicast 2000::/3 are refused for IPv6; private,
+ *      loopback, link-local, CGNAT, multicast, reserved and test ranges are refused for IPv4.
+ *   4. Redirects are followed manually (at most MAX_REDIRECTS), and each target goes through steps 1-3 again.
+ *   5. Connect/idle timeout, a TOTAL deadline for the whole fetch (all redirects), a Content-Length pre-check and a
+ *      hard streaming size cap.
+ *   6. The Content-Type must be an image type AND the bytes must start with a known image signature.
  *
- * Returns { body: Buffer, contentType: string } or throws SsrfError / FetchError.
+ * Returns { body: Buffer, contentType } or throws SsrfError (policy) / FetchError (network, size, format).
  */
 
 import { get as httpGet } from 'node:http'
 import { get as httpsGet } from 'node:https'
-import { resolve4, resolve6 } from 'node:dns/promises'
-import { URL } from 'node:url'
+import { lookup as dnsLookup } from 'node:dns/promises'
+import { BlockList, isIP } from 'node:net'
 
 // --------------------------------------------------------------------------- constants
-export const MAX_FETCH_BYTES = 5 * 1024 * 1024           // 5 MB hard cap
-const CONNECT_TIMEOUT_MS    = 5_000
-const MAX_REDIRECTS         = 1                           // follow at most one redirect
-const ALLOWED_SCHEMES       = new Set(['http:', 'https:'])
+export const MAX_FETCH_BYTES = 5 * 1024 * 1024 // 5 MB hard cap
+export const IDLE_TIMEOUT_MS = 5_000 // connect + no-data timeout per socket
+export const TOTAL_TIMEOUT_MS = 10_000 // whole fetch, including redirects
+export const MAX_REDIRECTS = 3
+const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308])
 const ALLOWED_CONTENT_TYPES = new Set(['image/jpeg', 'image/png', 'image/webp'])
 
-// Image magic-byte signatures (same list used by the AI inspection module)
 const SIGNATURES = [
   { type: 'image/jpeg', test: (b) => b.length > 3 && b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff },
-  { type: 'image/png',  test: (b) => b.length > 8 && b.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])) },
+  { type: 'image/png', test: (b) => b.length > 8 && b.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])) },
   { type: 'image/webp', test: (b) => b.length > 12 && b.toString('ascii', 0, 4) === 'RIFF' && b.toString('ascii', 8, 12) === 'WEBP' },
 ]
 
-// --------------------------------------------------------------------------- error types
+// --------------------------------------------------------------------------- errors
 export class SsrfError extends Error {
   constructor(reason) { super(reason); this.name = 'SsrfError' }
 }
@@ -43,209 +45,177 @@ export class FetchError extends Error {
   constructor(reason) { super(reason); this.name = 'FetchError' }
 }
 
-// --------------------------------------------------------------------------- IP-range checks
+// --------------------------------------------------------------------------- address policy
+const BLOCKED_V4 = [
+  ['0.0.0.0', 8], //        "this" network
+  ['10.0.0.0', 8], //       private
+  ['100.64.0.0', 10], //    carrier-grade NAT
+  ['127.0.0.0', 8], //      loopback
+  ['169.254.0.0', 16], //   link-local, cloud metadata (169.254.169.254)
+  ['172.16.0.0', 12], //    private
+  ['192.0.0.0', 24], //     IETF protocol assignments
+  ['192.0.2.0', 24], //     TEST-NET-1
+  ['192.88.99.0', 24], //   6to4 relay (deprecated)
+  ['192.168.0.0', 16], //   private
+  ['198.18.0.0', 15], //    benchmarking
+  ['198.51.100.0', 24], //  TEST-NET-2
+  ['203.0.113.0', 24], //   TEST-NET-3
+  ['224.0.0.0', 4], //      multicast
+  ['240.0.0.0', 4], //      reserved + broadcast
+]
+const BLOCKED_V6 = [
+  ['::', 96], //            unspecified, loopback and deprecated IPv4-compatible addresses
+  ['64:ff9b::', 96], //     NAT64 (embeds an IPv4 address)
+  ['64:ff9b:1::', 48], //   local-use NAT64
+  ['100::', 64], //         discard-only
+  ['2001::', 32], //        Teredo (embeds an IPv4 address)
+  ['2001:db8::', 32], //    documentation
+  ['2002::', 16], //        6to4 (embeds an IPv4 address)
+  ['fc00::', 7], //         unique local
+  ['fe80::', 10], //        link-local (fe80:: to febf::)
+  ['fec0::', 10], //        site-local (deprecated)
+  ['ff00::', 8], //         multicast
+]
+const blockedV4 = new BlockList()
+for (const [net, prefix] of BLOCKED_V4) blockedV4.addSubnet(net, prefix, 'ipv4')
+const blockedV6 = new BlockList()
+for (const [net, prefix] of BLOCKED_V6) blockedV6.addSubnet(net, prefix, 'ipv6')
+const globalUnicastV6 = new BlockList() // the only IPv6 space we ever connect to
+globalUnicastV6.addSubnet('2000::', 3, 'ipv6')
 
-// Returns true when the string looks like an IPv4 dotted-decimal literal.
-function isIPv4Literal(s) {
-  return /^(\d{1,3}\.){3}\d{1,3}$/.test(s)
-}
-
-// Returns true when the string looks like an IPv6 literal (with or without brackets).
-function isIPv6Literal(s) {
-  // IPv6 literals in URLs appear inside brackets: [::1]
-  return s.startsWith('[') || s.includes(':')
-}
-
-// Parse an IPv4 dotted-decimal string into a 32-bit unsigned integer.
-function ipv4ToInt(ip) {
-  const parts = ip.split('.').map(Number)
-  return ((parts[0] << 24) | (parts[1] << 16) | (parts[2] << 8) | parts[3]) >>> 0
-}
-
-// Returns true when the IPv4 address must be blocked.
-function isBlockedIPv4(ip) {
-  const n = ipv4ToInt(ip)
-  // 0.0.0.0/8 — "this" network
-  if ((n >>> 24) === 0)   return true
-  // 10.0.0.0/8
-  if ((n >>> 24) === 10)  return true
-  // 127.0.0.0/8 — loopback
-  if ((n >>> 24) === 127) return true
-  // 169.254.0.0/16 — link-local / AWS metadata (169.254.169.254)
-  if ((n >>> 16) === ((169 << 8) | 254)) return true
-  // 172.16.0.0/12
-  const second = (n >>> 20) & 0xf
-  if ((n >>> 24) === 172 && second >= 0 && second <= 15) return true
-  // 192.168.0.0/16
-  if ((n >>> 16) === ((192 << 8) | 168)) return true
-  // 100.64.0.0/10 — IANA shared address space (often used by cloud NAT)
-  if ((n >>> 22) === ((100 << 2) | 1)) return true
-  // 192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24 — TEST-NET
-  if ((n >>> 8) === ((192 << 16) | (0 << 8) | 2))    return true
-  if ((n >>> 8) === ((198 << 16) | (51 << 8) | 100)) return true
-  if ((n >>> 8) === ((203 << 16) | (0 << 8) | 113))  return true
-  return false
-}
-
-// Returns true when the IPv6 address must be blocked.
-function isBlockedIPv6(ip) {
-  // Strip zone ID (%eth0 etc.)
-  const bare = ip.split('%')[0].toLowerCase()
-  if (bare === '::1')             return true  // loopback
-  if (bare === '::')              return true  // unspecified
-  if (bare.startsWith('fe80:'))   return true  // link-local
-  if (bare.startsWith('fc') || bare.startsWith('fd')) return true  // unique-local (RFC 4193)
-  if (bare.startsWith('::ffff:')) {
-    // IPv4-mapped: ::ffff:169.254.169.254, ::ffff:127.0.0.1, etc.
-    const v4 = bare.slice(7)
-    if (/^\d+\.\d+\.\d+\.\d+$/.test(v4) && isBlockedIPv4(v4)) return true
+// True when we must NOT connect to this address. Anything that is not a valid IP literal counts as blocked.
+export function isBlockedAddress(address) {
+  if (typeof address !== 'string') return true
+  const ip = address.replace(/^\[|\]$/g, '').split('%')[0] // [::1] -> ::1, fe80::1%eth0 -> fe80::1
+  const family = isIP(ip)
+  if (family === 4) return blockedV4.check(ip, 'ipv4')
+  if (family === 6) {
+    // IPv4-mapped (::ffff:a.b.c.d / ::ffff:7f00:1) is outside 2000::/3, so it is refused here whatever it wraps.
+    return !globalUnicastV6.check(ip, 'ipv6') || blockedV6.check(ip, 'ipv6')
   }
-  return false
+  return true
 }
 
-// --------------------------------------------------------------------------- URL validation (string-level)
-function validateUrlString(urlString) {
+// --------------------------------------------------------------------------- URL validation
+function parseAndCheckUrl(urlString, isBlocked, allowHttp) {
   let parsed
   try { parsed = new URL(urlString) } catch { throw new SsrfError('Invalid URL') }
-  if (!ALLOWED_SCHEMES.has(parsed.protocol)) throw new SsrfError('Only http and https URLs are permitted')
-  const host = parsed.hostname.toLowerCase()
-  // Reject plain localhost and empty hostname before DNS
-  if (host === 'localhost' || host === '') throw new SsrfError('Blocked host')
-  // Reject IP literals immediately without a DNS round-trip
-  if (isIPv4Literal(host) && isBlockedIPv4(host)) throw new SsrfError(`Blocked IPv4 address: ${host}`)
-  const bare = host.startsWith('[') ? host.slice(1, -1) : host
-  if (isIPv6Literal(host) && isBlockedIPv6(bare)) throw new SsrfError(`Blocked IPv6 address: ${bare}`)
-  return parsed
+  if (parsed.protocol !== 'https:' && !(allowHttp && parsed.protocol === 'http:')) throw new SsrfError('Only https URLs are permitted')
+  if (parsed.username || parsed.password) throw new SsrfError('Credentials in URLs are not permitted')
+  const host = parsed.hostname.toLowerCase().replace(/\.$/, '')
+  if (!host || host === 'localhost' || host.endsWith('.localhost')) throw new SsrfError('Blocked host')
+  const literal = host.replace(/^\[|\]$/g, '')
+  if (isIP(literal) && isBlocked(literal)) throw new SsrfError('Blocked address')
+  return { parsed, literal: isIP(literal) ? literal : null }
 }
 
-// --------------------------------------------------------------------------- DNS + IP validation
-async function resolveAndCheck(hostname) {
-  // If the hostname is already an IP literal, skip DNS and check it directly.
-  if (isIPv4Literal(hostname)) {
-    if (isBlockedIPv4(hostname)) throw new SsrfError(`Blocked IPv4 address: ${hostname}`)
-    return
+// A `lookup` for http(s).get: resolves once, validates every address, and returns only validated ones.
+// The socket connects to exactly what this returns, so a second DNS answer can never be used.
+function makeLookup(resolver, isBlocked) {
+  return (hostname, options, callback) => {
+    if (typeof options === 'function') { callback = options; options = {} }
+    Promise.resolve()
+      .then(() => resolver(hostname, { all: true, verbatim: true }))
+      .then((addresses) => {
+        if (!Array.isArray(addresses) || addresses.length === 0) throw new FetchError('Could not resolve host')
+        for (const a of addresses) if (isBlocked(a.address)) throw new SsrfError('Blocked address')
+        if (options?.all) callback(null, addresses.map(({ address, family }) => ({ address, family })))
+        else callback(null, addresses[0].address, addresses[0].family)
+      })
+      .catch((err) => callback(err instanceof SsrfError || err instanceof FetchError ? err : new FetchError('Could not resolve host')))
   }
-  const bare = hostname.startsWith('[') ? hostname.slice(1, -1) : hostname
-  if (isIPv6Literal(hostname)) {
-    if (isBlockedIPv6(bare)) throw new SsrfError(`Blocked IPv6 address: ${bare}`)
-    return
-  }
-
-  const errors = []
-  let hasV4 = false, hasV6 = false
-
-  // Try IPv4
-  try {
-    const v4 = await resolve4(hostname)
-    hasV4 = true
-    for (const ip of v4) {
-      if (isBlockedIPv4(ip)) throw new SsrfError(`Blocked IPv4 address: ${ip}`)
-    }
-  } catch (err) {
-    if (err instanceof SsrfError) throw err
-    errors.push(err)
-  }
-
-  // Try IPv6
-  try {
-    const v6 = await resolve6(hostname)
-    hasV6 = true
-    for (const ip of v6) {
-      if (isBlockedIPv6(ip)) throw new SsrfError(`Blocked IPv6 address: ${ip}`)
-    }
-  } catch (err) {
-    if (err instanceof SsrfError) throw err
-    errors.push(err)
-  }
-
-  if (!hasV4 && !hasV6) throw new FetchError('Could not resolve host')
 }
 
-// --------------------------------------------------------------------------- HTTP GET with timeout
-function httpGetWithTimeout(parsedUrl, timeoutMs) {
+// --------------------------------------------------------------------------- one HTTP exchange
+function request(parsed, literal, { lookup, signal }) {
   return new Promise((resolve, reject) => {
-    const getter = parsedUrl.protocol === 'https:' ? httpsGet : httpGet
+    const getter = parsed.protocol === 'https:' ? httpsGet : httpGet
     const req = getter(
       {
-        hostname: parsedUrl.hostname,
-        port:     parsedUrl.port || (parsedUrl.protocol === 'https:' ? 443 : 80),
-        path:     parsedUrl.pathname + parsedUrl.search,
-        headers:  { 'User-Agent': 'ReturnFlow-DemoFetcher/1.0', Accept: 'image/*' },
-        timeout:  timeoutMs,
+        hostname: literal ?? parsed.hostname, // IPv6 literals without brackets
+        port: parsed.port || (parsed.protocol === 'https:' ? 443 : 80),
+        path: parsed.pathname + parsed.search,
+        headers: { 'User-Agent': 'ReturnFlow-ImageFetcher/1.0', Accept: 'image/jpeg,image/png,image/webp', 'Accept-Encoding': 'identity' },
+        agent: false, // no pooled sockets: each hop dials the address validated for it
+        lookup,
+        timeout: IDLE_TIMEOUT_MS,
+        signal,
       },
-      (res) => resolve(res),
+      resolve,
     )
-    req.on('timeout', () => { req.destroy(); reject(new FetchError('Request timed out')) })
-    req.on('error',   (err) => reject(new FetchError(`Network error: ${err.code ?? err.message}`)))
+    req.on('timeout', () => req.destroy(new FetchError('Request timed out')))
+    req.on('error', (err) => {
+      if (err instanceof SsrfError || err instanceof FetchError) return reject(err)
+      if (signal?.aborted) return reject(new FetchError('Request timed out'))
+      reject(new FetchError(`Network error: ${err.code ?? 'unknown'}`))
+    })
   })
 }
 
-// --------------------------------------------------------------------------- body reader with size cap
-function readBodyCapped(res, maxBytes) {
+function readBodyCapped(res, maxBytes, signal) {
   return new Promise((resolve, reject) => {
     const chunks = []
     let total = 0
+    let settled = false
+    const finish = (fn, value) => { if (!settled) { settled = true; fn(value) } }
+    // reject FIRST, then destroy: destroying emits 'aborted'/'close', which must not win the race with the real reason
+    const fail = (err) => { finish(reject, err); res.destroy() }
+    signal?.addEventListener('abort', () => fail(new FetchError('Request timed out')), { once: true })
     res.on('data', (chunk) => {
       total += chunk.length
-      if (total > maxBytes) {
-        res.destroy()
-        return reject(new FetchError('Response too large'))
-      }
+      if (total > maxBytes) return fail(new FetchError('Response too large'))
       chunks.push(chunk)
     })
-    res.on('end',   () => resolve(Buffer.concat(chunks)))
-    res.on('error', (err) => reject(new FetchError(`Read error: ${err.message}`)))
+    res.on('end', () => finish(resolve, Buffer.concat(chunks)))
+    res.on('error', () => fail(new FetchError(signal?.aborted ? 'Request timed out' : 'Read error')))
+    res.on('aborted', () => fail(new FetchError(signal?.aborted ? 'Request timed out' : 'Read error')))
+    res.on('close', () => { if (!res.complete) fail(new FetchError(signal?.aborted ? 'Request timed out' : 'Read error')) })
   })
 }
 
 // --------------------------------------------------------------------------- main export
 /**
- * Safely fetch an external image URL.
- *
- * @param {string} urlString   - The URL to fetch (from a trusted DB column).
- * @param {number} [redirectsLeft=MAX_REDIRECTS]  - Recursion counter for redirects.
- * @returns {Promise<{body: Buffer, contentType: string}>}
- * @throws {SsrfError} on policy violations (blocked host, unsafe redirect, etc.)
- * @throws {FetchError} on network / protocol errors
+ * @param {string} urlString
+ * @param {object} [deps] test seams; production code passes nothing
+ * @param {Function} [deps.resolver]  async (hostname, {all, verbatim}) => [{address, family}]
+ * @param {Function} [deps.isBlocked] address policy (tests relax it only to reach a local test server)
+ * @param {number}   [deps.totalTimeoutMs]
+ * @param {boolean}  [deps.allowHttp]  tests only: lets the local plain-http test servers be reached. Never set in production code.
  */
-export async function safeFetchImage(urlString, redirectsLeft = MAX_REDIRECTS) {
-  // 1. Validate URL string
-  const parsed = validateUrlString(urlString)
+export async function safeFetchImage(urlString, { resolver = dnsLookup, isBlocked = isBlockedAddress, totalTimeoutMs = TOTAL_TIMEOUT_MS, maxBytes = MAX_FETCH_BYTES, allowHttp = false } = {}) {
+  const controller = new AbortController()
+  const deadline = setTimeout(() => controller.abort(), totalTimeoutMs)
+  const lookup = makeLookup(resolver, isBlocked)
+  const seen = new Set()
+  try {
+    let current = urlString
+    for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
+      const { parsed, literal } = parseAndCheckUrl(current, isBlocked, allowHttp)
+      if (seen.has(parsed.href)) throw new FetchError('Redirect loop')
+      seen.add(parsed.href)
 
-  // 2. DNS resolution + IP-range check
-  await resolveAndCheck(parsed.hostname)
+      const res = await request(parsed, literal, { lookup, signal: controller.signal })
 
-  // 3. HTTP GET with timeout
-  const res = await httpGetWithTimeout(parsed, CONNECT_TIMEOUT_MS)
+      if (REDIRECT_STATUSES.has(res.statusCode) && res.headers.location) {
+        res.destroy()
+        if (hop === MAX_REDIRECTS) throw new FetchError('Too many redirects')
+        try { current = new URL(res.headers.location, parsed).toString() } catch { throw new SsrfError('Invalid redirect URL') }
+        continue // the next loop turn validates the target exactly like the first URL
+      }
+      if (res.statusCode !== 200) { res.destroy(); throw new FetchError(`Unexpected HTTP status: ${res.statusCode}`) }
 
-  // 4. Handle redirects (only up to MAX_REDIRECTS times)
-  if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-    res.destroy()
-    if (redirectsLeft <= 0) throw new FetchError('Too many redirects')
-    // Resolve relative redirects
-    const next = new URL(res.headers.location, urlString).toString()
-    return safeFetchImage(next, redirectsLeft - 1)
+      const contentType = (res.headers['content-type'] ?? '').split(';')[0].trim().toLowerCase()
+      if (!ALLOWED_CONTENT_TYPES.has(contentType)) { res.destroy(); throw new FetchError('Unsupported content type') }
+      const declared = Number(res.headers['content-length'])
+      if (Number.isFinite(declared) && declared > maxBytes) { res.destroy(); throw new FetchError('Response too large') }
+
+      const body = await readBodyCapped(res, maxBytes, controller.signal)
+      const real = SIGNATURES.find((s) => s.test(body)) // the bytes decide, not the header
+      if (!real) throw new FetchError('Response body is not a recognised image format')
+      return { body, contentType: real.type }
+    }
+    throw new FetchError('Too many redirects')
+  } finally {
+    clearTimeout(deadline)
   }
-
-  // 5. Require 200
-  if (res.statusCode !== 200) {
-    res.destroy()
-    throw new FetchError(`Unexpected HTTP status: ${res.statusCode}`)
-  }
-
-  // 6. Content-Type header check (advisory — magic bytes are the real gate)
-  const ct = (res.headers['content-type'] ?? '').split(';')[0].trim().toLowerCase()
-  if (!ALLOWED_CONTENT_TYPES.has(ct)) {
-    res.destroy()
-    throw new FetchError(`Unsupported content type: ${ct}`)
-  }
-
-  // 7. Read body with size cap
-  const body = await readBodyCapped(res, MAX_FETCH_BYTES)
-
-  // 8. Magic-byte verification (ignore the Content-Type header from here on)
-  const real = SIGNATURES.find((s) => s.test(body))
-  if (!real) throw new FetchError('Response body is not a recognised image format')
-
-  return { body, contentType: real.type }
 }

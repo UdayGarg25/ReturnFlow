@@ -151,7 +151,7 @@ export async function retryAiAssessment(inspectionId) {
 
 // An evidence image (product reference or a customer photo), streamed by the backend with the session cookie.
 export async function fetchEvidenceBlob(inspectionId, kind, { signal, imageId } = {}) {
-  const path = kind === 'reference' ? 'reference' : `photos/${encodeURIComponent(imageId)}`
+  const path = kind === 'reference' ? 'reference' : kind === 'demo-photo' ? 'demo-photo' : `photos/${encodeURIComponent(imageId)}`
   let res
   try {
     res = await fetch(`${API_URL}/api/warehouse/inspections/${encodeURIComponent(inspectionId)}/evidence/${path}`, { credentials: 'include', signal })

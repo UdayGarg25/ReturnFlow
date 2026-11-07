@@ -12,7 +12,7 @@
     "db:seed-demo": "node src/config/setup.js --demo-only",
     "db:seed-admin": "node src/config/seedAdmin.js",
     "db:reset": "node src/config/setup.js --reset --seed",
-    "test": "echo \"Error: no test specified\" && exit 1",
+    "test": "npm run test:unit",
     "setup:sony-image": "node scripts/setup-sony-image.js",
     "test:ai": "node scripts/ai-inspection-test.js",
     "test:ai:live": "node scripts/ai-inspection-live-test.js",
@@ -21,12 +21,19 @@
     "test:cache-phase6": "node --test tests/cache-phase6-step2.test.js",
     "test:ratelimit-phase6": "node --test tests/ratelimit-phase6-step3.test.js",
     "test:lock-phase6": "node --test tests/lock-phase6-step4.test.js",
-    "test:image-fallback": "node --test tests/image-fallback-phase6.test.js"
+    "test:image-fallback": "node --test tests/image-fallback-phase6.test.js",
+    "test:unit": "node --test --test-timeout=30000 tests/redis-phase6-step1.test.js tests/cache-phase6-step2.test.js tests/ratelimit-phase6-step3.test.js tests/lock-phase6-step4.test.js tests/redis-reliability.unit.test.js tests/ratelimit-api-proxy.test.js tests/safefetch-security.test.js tests/image-fallback-phase6.test.js tests/ratelimit-atomic.test.js tests/health-access.test.js tests/demo-fixtures.test.js tests/ratelimit-logging.test.js tests/deploy-config.test.js tests/demo-email-block.test.js tests/db-safeguards.test.js",
+    "test:integration:db": "node --test --test-concurrency=1 --test-timeout=240000 tests/ai-context.integration.test.js tests/demo-evidence.integration.test.js tests/demo-email-block.integration.test.js tests/db-safeguards.integration.test.js",
+    "test:integration:redis": "node --test --test-concurrency=1 --test-timeout=180000 tests/redis-real.integration.test.js tests/redis-backend-outage.integration.test.js tests/redis-multi-instance.integration.test.js",
+    "db:demo-images": "node scripts/apply-demo-image-fixtures.js"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.1146.0",
     "@openrouter/sdk": "^1.4.25",
