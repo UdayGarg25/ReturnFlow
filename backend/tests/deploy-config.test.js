@@ -5,7 +5,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import http from 'node:http'
 import { spawnSync } from 'node:child_process'
-import { readFileSync } from 'node:fs'
+import { readdirSync, readFileSync, statSync } from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { buildPoolConfig } from '../src/config/dbConfig.js'
@@ -94,9 +94,40 @@ test('the real setup script refuses before touching any database (exit 1, messag
 })
 
 // -------------------------------------------------------------------------------------------- hosting config / app
-test('Vercel: every path falls back to index.html (deep links survive a refresh)', () => {
+test('Vercel: /api is proxied to the backend FIRST (same origin, so the SameSite=Lax cookie works), then every other path falls back to index.html', () => {
   const v = JSON.parse(readFileSync(path.join(root, '..', 'frontend', 'vercel.json'), 'utf8'))
-  assert.deepEqual(v.rewrites, [{ source: '/(.*)', destination: '/index.html' }])
+  assert.deepEqual(v.rewrites, [
+    { source: '/api/:path*', destination: 'https://returnflow-4ab7.onrender.com/api/:path*' }, // must precede the catch-all, or /api/... would get index.html
+    { source: '/(.*)', destination: '/index.html' },
+  ])
+  const target = new globalThis.URL(v.rewrites[0].destination) // (this file has its own constant named URL)
+  assert.equal(target.protocol, 'https:'); assert.equal(target.search, ''); assert.equal(target.username, ''); assert.equal(target.password, '')
+  // only the API prefix is proxied: the backend's /health and every other path are not exposed through the frontend domain
+  assert.equal(v.rewrites.filter((r) => /^https?:/.test(r.destination)).length, 1)
+})
+
+test('Vercel: proxied API responses are never cached at the CDN, and the global security headers are kept', () => {
+  const v = JSON.parse(readFileSync(path.join(root, '..', 'frontend', 'vercel.json'), 'utf8'))
+  const rule = (source) => v.headers.find((h) => h.source === source)?.headers ?? []
+  assert.deepEqual(rule('/api/:path*'), [{ key: 'x-vercel-enable-rewrite-caching', value: '0' }])
+  const global = Object.fromEntries(rule('/(.*)').map((h) => [h.key, h.value]))
+  assert.equal(global['X-Content-Type-Options'], 'nosniff'); assert.equal(global['X-Frame-Options'], 'DENY'); assert.ok(global['Referrer-Policy'])
+})
+
+test('the frontend sends every API call under /api, which is the only prefix the Vercel proxy forwards', () => {
+  const files = []
+  const walk = (dir) => { for (const f of readdirSync(dir)) { const p = path.join(dir, f); statSync(p).isDirectory() ? walk(p) : /\.(js|jsx)$/.test(p) && files.push(p) } }
+  walk(path.join(root, '..', 'frontend', 'src'))
+  const offenders = []
+  for (const f of files) {
+    for (const m of readFileSync(f, 'utf8').matchAll(/(?:fetch\(|xhr\.open\([^,]+,\s*|request\()\s*[`'"]([^`'"]*)/g)) {
+      const url = m[1]
+      if (url.startsWith('${API_URL}')) { if (!url.slice('${API_URL}'.length).startsWith('/api/') && !url.slice('${API_URL}'.length).startsWith('${')) offenders.push(`${path.basename(f)}: ${url}`) }
+      else if (url.startsWith('/') && !url.startsWith('/api/')) offenders.push(`${path.basename(f)}: ${url}`)
+      else if (/^https?:/.test(url)) offenders.push(`${path.basename(f)}: ${url}`)
+    }
+  }
+  assert.deepEqual(offenders, [])
 })
 
 test('the backend declares the Node versions it needs', () => {
