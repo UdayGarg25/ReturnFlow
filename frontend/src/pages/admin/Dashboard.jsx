@@ -23,7 +23,7 @@ export default function Dashboard() {
   })
   const actions = useInvitationActions(reload)
 
-  const header = <PageHeader title="Admin Dashboard" subtitle="Manage users and send invitations to onboard sellers, pickup agents and warehouse staff." />
+  const header = <PageHeader title="Admin Dashboard" subtitle="Manage users and invitations for sellers, pickup agents and warehouse staff." />
   if (error) return <>{header}<ErrorState error={error} onRetry={reload} /></>
 
   // The invite card stays mounted while the lists reload, so its result message is not lost.

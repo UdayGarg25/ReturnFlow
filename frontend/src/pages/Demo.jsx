@@ -13,7 +13,7 @@ const OVERVIEW = [
 ]
 
 const ADMIN_CAN = [
-  'Invite new team members by email',
+  'Explore the invitation workflow (email sending is disabled in this demo)',
   'Assign an operational role (Seller, Pickup Agent, Warehouse)',
   'See every existing user',
   'Track invitation status; resend or cancel invitations',
@@ -82,8 +82,7 @@ export default function Demo() {
                     {ADMIN_CAN.map((t) => <li key={t} className="flex gap-2"><span aria-hidden="true" className="mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full bg-indigo-500" />{t}</li>)}
                   </ul>
                   <p className="mt-4 rounded-lg bg-slate-50 p-3 text-xs text-slate-600">
-                    Roles are assigned by the server from the invitation, never chosen in the browser, and ADMIN can never be invited. Logging in here sends no email; an
-                    invitation email is only sent when an admin deliberately invites an address.
+                    Roles are assigned by the server from the invitation, never chosen in the browser, and ADMIN can never be invited. Email sending is disabled in the public demo. Admins can explore the invitation workflow, but no actual emails are sent.
                   </p>
                 </div>
               </div>

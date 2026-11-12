@@ -1,14 +1,17 @@
 import { Mail, Send } from 'lucide-react'
 import { useState } from 'react'
+import useApi from '../hooks/useApi.js'
 import { INVITE_ROLES, sendInvitations } from '../services/adminService.js'
+import { getDemoEnabled } from '../services/demoService.js'
 import Button from './Button.jsx'
 import Card from './Card.jsx'
 import { SelectField, TextAreaField } from './FormField.jsx'
 import Notice from './Notice.jsx'
 
 // The admin's invite form: one role + many email addresses (one per line) + optional note.
-// The backend validates, de-duplicates, creates the invitations and sends the emails; this card
-// only reports what happened. `onSent` lets the page re-read its lists.
+// The backend validates, de-duplicates, creates the invitations and sends the emails (in the public demo it sends
+// none: the backend blocks all email there, and this card says so); this card only reports what happened.
+// `onSent` lets the page re-read its lists.
 export default function InviteUsersCard({ onSent }) {
   const [role, setRole] = useState('PICKUP_AGENT')
   const [emails, setEmails] = useState('')
@@ -17,6 +20,7 @@ export default function InviteUsersCard({ onSent }) {
   const [submitting, setSubmitting] = useState(false)
   const [result, setResult] = useState(null)
   const [failure, setFailure] = useState(null)
+  const demoMode = useApi((signal) => getDemoEnabled({ signal })).data === true // public demo: no email is ever sent
 
   const submit = async (e) => {
     e.preventDefault()
@@ -50,11 +54,12 @@ export default function InviteUsersCard({ onSent }) {
         </span>
         <div>
           <h2 className="text-base font-semibold text-navy-900">Invite Users</h2>
-          <p className="text-sm text-slate-500">Send invitation emails to onboard new users.</p>
+          <p className="text-sm text-slate-500">{demoMode ? 'Explore how new users are invited.' : 'Send invitation emails to onboard new users.'}</p>
         </div>
       </div>
 
       <form onSubmit={submit} className="space-y-4" noValidate>
+        {demoMode && <Notice tone="info">Email sending is disabled in the public demo. Admins can explore the invitation workflow, but no actual emails are sent.</Notice>}
         {failure && <Notice tone="error">{failure}</Notice>}
         <SelectField label="Role" name="role" options={INVITE_ROLES} value={role} onChange={(e) => setRole(e.target.value)} error={errors.role} />
         <TextAreaField
@@ -71,23 +76,24 @@ export default function InviteUsersCard({ onSent }) {
           label="Message (Optional)"
           name="message"
           rows={3}
-          placeholder="Add a personal message to the invitation email..."
+          placeholder={demoMode ? 'Add an optional note (no email is sent in the demo)...' : 'Add a personal message to the invitation email...'}
           value={message}
           onChange={(e) => setMessage(e.target.value)}
           error={errors.message}
         />
         <Button type="submit" fullWidth size="lg" disabled={submitting}>
-          <Send size={16} aria-hidden="true" /> {submitting ? 'Sending...' : 'Send Invitations'}
+          <Send size={16} aria-hidden="true" /> {demoMode ? (submitting ? 'Creating...' : 'Create Invitations (no email sent)') : (submitting ? 'Sending...' : 'Send Invitations')}
         </Button>
       </form>
 
-      {result && <Result result={result} />}
+      {result && <Result result={result} demoMode={demoMode} />}
     </Card>
   )
 }
 
-function Result({ result }) {
-  const failed = result.invitations.filter((i) => !i.emailed)
+function Result({ result, demoMode }) {
+  // In the public demo no email is ever sent, so "not emailed" is the normal outcome there, not a failure to warn about.
+  const failed = demoMode ? [] : result.invitations.filter((i) => !i.emailed)
   const links = result.invitations.filter((i) => i.devLink)
   const tone = result.created === 0 ? 'error' : result.skipped.length > 0 || failed.length > 0 ? 'warning' : 'success'
   return (
@@ -95,9 +101,10 @@ function Result({ result }) {
       <Notice tone={tone}>
         <p className="font-semibold">
           {result.entered} {result.entered === 1 ? 'email' : 'emails'} entered, {result.created} {result.created === 1 ? 'invitation' : 'invitations'} created
-          {result.devMode ? '' : `, ${result.emailed} accepted for sending`}
+          {result.devMode || demoMode ? '' : `, ${result.emailed} accepted for sending`}
         </p>
         {result.devMode && result.created > 0 && <p className="mt-1">Development mode: no real emails were sent. Use the links below.</p>}
+        {demoMode && result.created > 0 && <p className="mt-1">Demo invitation created successfully. No email was sent.</p>}
         {failed.length > 0 && (
           <ul className="mt-2 list-disc pl-5">
             {failed.map((i) => <li key={i.id} className="break-all">{i.email}: {i.emailError}</li>)}

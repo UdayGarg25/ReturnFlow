@@ -18,7 +18,7 @@ export default function InvitationFeedback({ actions }) {
       {confirmCancel && (
         <div role="alertdialog" aria-label="Confirm cancelling the invitation" className="mb-4 rounded-xl border border-red-200 bg-red-50 p-4">
           <p className="text-sm font-semibold text-red-900">Cancel the invitation for {confirmCancel.email}?</p>
-          <p className="mt-1 text-sm text-red-800">The link in their email will stop working.</p>
+          <p className="mt-1 text-sm text-red-800">The invitation will no longer be valid.</p>
           <div className="mt-4 flex flex-col-reverse gap-3 sm:flex-row sm:justify-end">
             <Button variant="secondary" onClick={() => actions.askCancel(null)} disabled={busyId !== null}>Keep invitation</Button>
             <Button variant="danger" onClick={() => actions.cancel(confirmCancel)} disabled={busyId !== null}>{busyId !== null ? 'Cancelling...' : 'Cancel invitation'}</Button>
