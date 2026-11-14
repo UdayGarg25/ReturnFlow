@@ -1,4 +1,4 @@
-import { AUTH_ERRORS, login as loginService, registerCustomer } from '../services/auth.service.js'
+import { AUTH_ERRORS, changePassword as changePasswordService, login as loginService, registerCustomer } from '../services/auth.service.js'
 import { clearAuthCookie, setAuthCookie } from '../utils/cookies.js'
 import { ServiceError } from '../utils/errors.js'
 
@@ -9,6 +9,8 @@ const HTTP_ERRORS = {
   [AUTH_ERRORS.EMAIL_TAKEN]: (err) => ({ status: 409, body: { message: err.message } }),
   [AUTH_ERRORS.INVALID_CREDENTIALS]: (err) => ({ status: 401, body: { message: err.message } }),
   [AUTH_ERRORS.USER_NOT_FOUND]: () => ({ status: 401, body: { message: 'Authentication required' } }),
+  [AUTH_ERRORS.DEMO_ACCOUNT]: (err) => ({ status: 403, body: { message: err.message } }),
+  [AUTH_ERRORS.CONFLICT]: (err) => ({ status: 409, body: { message: err.message } }),
 }
 
 function sendError(err, res, next) {
@@ -52,4 +54,16 @@ export function me(req, res) {
 export function logout(req, res) {
   clearAuthCookie(res)
   return res.status(200).json({ message: 'Logged out successfully' })
+}
+
+// POST /api/auth/change-password  { currentPassword, newPassword, confirmPassword }  (behind `authenticate`)
+// Always acts on the logged-in user (req.user.id); there is no way to name another account.
+export async function changePassword(req, res, next) {
+  try {
+    const { currentPassword, newPassword, confirmPassword } = req.body ?? {}
+    await changePasswordService(req.user.id, { currentPassword, newPassword, confirmPassword })
+    return res.status(200).json({ message: 'Your password was updated.' })
+  } catch (err) {
+    return sendError(err, res, next)
+  }
 }

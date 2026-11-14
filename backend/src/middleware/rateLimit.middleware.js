@@ -304,3 +304,11 @@ export const apiLimiter = createRateLimiter({
     return userId ? `user:${userId}` : `ip:${getClientIp(req)}`;
   },
 });
+
+// Password changes: per signed-in user, so a stolen session cannot be used to guess the current password quickly.
+export const changePasswordLimiter = createRateLimiter({
+  name: 'change_password',
+  windowMs: FIFTEEN_MINUTES,
+  max: number('RATE_LIMIT_CHANGE_PASSWORD_PER_USER', 10),
+  key: (req) => `user:${req.user?.id ?? getClientIp(req)}`,
+});

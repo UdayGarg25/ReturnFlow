@@ -1,7 +1,7 @@
-import { Camera, Lock } from 'lucide-react'
+import { Camera } from 'lucide-react'
 import Button from '../../components/Button.jsx'
 import Card from '../../components/Card.jsx'
-import { TextField } from '../../components/FormField.jsx'
+import ChangePasswordCard from '../../components/ChangePasswordCard.jsx'
 import PageHeader from '../../components/PageHeader.jsx'
 import { useAuth } from '../../context/useAuth.js'
 import { formatDate, initials } from '../../utils/format.js'
@@ -26,8 +26,6 @@ function ProfileRow({ label, value, editable }) {
 export default function ProfilePage({ showPhoto = false }) {
   const { user: account } = useAuth()
   const user = { ...account, role: ROLE_LABELS[account.role], joinedAt: account.createdAt }
-  // UI only: saving is wired up in the authentication phase.
-  const handleSubmit = (e) => e.preventDefault()
 
   const forms = (
     <>
@@ -40,14 +38,7 @@ export default function ProfilePage({ showPhoto = false }) {
         </dl>
       </Card>
 
-      <Card title="Change Password">
-        <form onSubmit={handleSubmit} className="space-y-4">
-          <TextField label="Current Password" icon={Lock} type="password" name="currentPassword" autoComplete="current-password" placeholder="Enter current password" />
-          <TextField label="New Password" icon={Lock} type="password" name="newPassword" autoComplete="new-password" placeholder="Enter new password" />
-          <TextField label="Confirm New Password" icon={Lock} type="password" name="confirmPassword" autoComplete="new-password" placeholder="Confirm new password" />
-          <Button type="submit" fullWidth size="lg">Update Password</Button>
-        </form>
-      </Card>
+      <ChangePasswordCard />
     </>
   )
 

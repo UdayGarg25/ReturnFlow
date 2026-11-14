@@ -1,3 +1,5 @@
+import { DEMO_ACCOUNT_EMAILS } from './demoAccounts.js';
+
 // Guard for src/config/setup.js. Pure (takes args and env) so it can be tested without a database.
 //
 // "Real database" means NODE_ENV=production OR a DATABASE_URL (a remote/managed database). Local development with the
@@ -26,10 +28,8 @@ export function checkSetupSafety(args, env = process.env) {
 // are NOT the seeded demo accounts (a real person registered, a personal account), then --reset (drops every table) and
 // --seed (fixed-id demo users) need the same explicit confirmation as a remote database. --demo-only is left alone on purpose:
 // it only replaces the demo accounts' own data and refuses by itself if a non-demo account has orders for demo products.
-export const DEMO_ACCOUNT_EMAILS = Object.freeze([
-  'alice@returnflow.test', 'bob@returnflow.test', 'priya@returnflow.test', 'rohan@returnflow.test',
-  'sam@returnflow.test', 'sara@returnflow.test', 'pete@returnflow.test', 'wendy@returnflow.test', 'admin@returnflow.test',
-]);
+// (The list itself lives in demoAccounts.js, the application's single list of demo accounts.)
+export { DEMO_ACCOUNT_EMAILS };
 
 export function checkSetupDataSafety(args, env, nonDemoAccounts, target = '(unknown)') {
   if (!(nonDemoAccounts > 0)) return null;

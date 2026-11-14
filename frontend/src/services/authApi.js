@@ -57,3 +57,6 @@ export const loginRequest = (email, password) => request('/api/auth/login', { me
 // Registration sends ONLY these three fields. The backend always creates a CUSTOMER.
 export const registerRequest = (name, email, password) => request('/api/auth/register', { method: 'POST', body: { name, email, password } })
 export const logoutRequest = () => request('/api/auth/logout', { method: 'POST' })
+// POST /api/auth/change-password. The backend refuses it for the shared demo accounts (403) and checks the current password.
+export const changePasswordRequest = (currentPassword, newPassword, confirmPassword) =>
+  request('/api/auth/change-password', { method: 'POST', body: { currentPassword, newPassword, confirmPassword } })

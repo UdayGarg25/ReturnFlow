@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto'
 import pool from '../config/db.js'
+import { isDemoAccountEmail } from '../config/demoAccounts.js'
 import { ServiceError } from '../utils/errors.js'
 import { generateToken } from '../utils/jwt.js'
 import { comparePassword, hashPassword } from '../utils/password.js'
@@ -9,11 +10,15 @@ import { comparePassword, hashPassword } from '../utils/password.js'
 //   EMAIL_TAKEN          -> 409
 //   INVALID_CREDENTIALS  -> 401   same error for "no such email" and "wrong password"
 //   USER_NOT_FOUND       -> 404
+//   DEMO_ACCOUNT         -> 403   a shared public demo account may not change its password
+//   CONFLICT             -> 409   the password changed while this request was running
 export const AUTH_ERRORS = Object.freeze({
   VALIDATION: 'VALIDATION_ERROR',
   EMAIL_TAKEN: 'EMAIL_TAKEN',
   INVALID_CREDENTIALS: 'INVALID_CREDENTIALS',
   USER_NOT_FOUND: 'USER_NOT_FOUND',
+  DEMO_ACCOUNT: 'DEMO_ACCOUNT',
+  CONFLICT: 'CONFLICT',
 })
 
 const PG_UNIQUE_VIOLATION = '23505'
@@ -30,6 +35,8 @@ const toSafeUser = (row) => ({
   role: row.role,
   createdAt: row.created_at,
   updatedAt: row.updated_at,
+  // true for the shared public demo accounts (see config/demoAccounts.js); the UI uses it to explain why passwords are locked
+  isDemoAccount: isDemoAccountEmail(row.email),
 })
 
 // The token carries only who the user is. Role and everything else is looked up
@@ -42,6 +49,13 @@ const NAME_MAX = 100
 const EMAIL_MAX = 254
 const PASSWORD_MIN = 8
 const PASSWORD_MAX_BYTES = 72 // bcrypt silently ignores everything after 72 bytes
+
+// The one length rule for a NEW password (registration and password change). Returns a message, or null when it is fine.
+const passwordLengthProblem = (password) => {
+  if (password.length < PASSWORD_MIN) return `Password must be at least ${PASSWORD_MIN} characters.`
+  if (Buffer.byteLength(password, 'utf8') > PASSWORD_MAX_BYTES) return `Password must be at most ${PASSWORD_MAX_BYTES} bytes.`
+  return null
+}
 
 // Returns the cleaned values, or throws a VALIDATION_ERROR listing every bad field.
 export function validateRegistration(input) {
@@ -58,8 +72,10 @@ export function validateRegistration(input) {
   else if (cleanEmail.length > EMAIL_MAX || !EMAIL_PATTERN.test(cleanEmail)) fieldErrors.email = 'Enter a valid email address.'
 
   if (typeof password !== 'string' || password === '') fieldErrors.password = 'Enter a password.'
-  else if (password.length < PASSWORD_MIN) fieldErrors.password = `Password must be at least ${PASSWORD_MIN} characters.`
-  else if (Buffer.byteLength(password, 'utf8') > PASSWORD_MAX_BYTES) fieldErrors.password = `Password must be at most ${PASSWORD_MAX_BYTES} bytes.`
+  else {
+    const problem = passwordLengthProblem(password)
+    if (problem) fieldErrors.password = problem
+  }
 
   if (Object.keys(fieldErrors).length > 0) {
     throw new ServiceError(AUTH_ERRORS.VALIDATION, 'Invalid registration details.', { fieldErrors })
@@ -148,3 +164,51 @@ export async function getCurrentUser(userId) {
 }
 
 const userNotFound = () => new ServiceError(AUTH_ERRORS.USER_NOT_FOUND, 'User not found.')
+
+// ------------------------------------------------------------- change password ----
+// Checks the three fields of a password change. Returns the values to use, or throws a VALIDATION_ERROR listing every bad field.
+export function validatePasswordChange(input) {
+  const { currentPassword, newPassword, confirmPassword } = input ?? {}
+  const fieldErrors = {}
+
+  if (typeof currentPassword !== 'string' || currentPassword === '') fieldErrors.currentPassword = 'Enter your current password.'
+
+  if (typeof newPassword !== 'string' || newPassword === '') fieldErrors.newPassword = 'Enter a new password.'
+  else {
+    const problem = passwordLengthProblem(newPassword)
+    if (problem) fieldErrors.newPassword = problem
+    else if (typeof currentPassword === 'string' && newPassword === currentPassword) fieldErrors.newPassword = 'Choose a password different from your current one.'
+  }
+
+  if (typeof confirmPassword !== 'string' || confirmPassword === '') fieldErrors.confirmPassword = 'Confirm your new password.'
+  else if (confirmPassword !== newPassword) fieldErrors.confirmPassword = 'The passwords do not match.'
+
+  if (Object.keys(fieldErrors).length > 0) {
+    throw new ServiceError(AUTH_ERRORS.VALIDATION, 'Invalid password change.', { fieldErrors })
+  }
+  return { currentPassword, newPassword }
+}
+
+// Changes the password of the logged-in user. Nothing about the session changes (the cookie stays valid; this app has no
+// server-side session list, so other signed-in browsers stay signed in until their token expires).
+export async function changePassword(userId, input) {
+  const { rows } = await pool.query('SELECT id, email, password_hash FROM users WHERE id = $1', [userId])
+  const row = rows[0]
+  if (!row) throw userNotFound()
+
+  // FIRST, before reading any input or touching the password hash: the shared public demo accounts can never be changed.
+  if (isDemoAccountEmail(row.email)) {
+    throw new ServiceError(AUTH_ERRORS.DEMO_ACCOUNT, 'Password changes are disabled for demo accounts.')
+  }
+
+  const { currentPassword, newPassword } = validatePasswordChange(input)
+
+  if (!(await comparePassword(currentPassword, row.password_hash))) {
+    throw new ServiceError(AUTH_ERRORS.VALIDATION, 'Invalid password change.', { fieldErrors: { currentPassword: 'Your current password is incorrect.' } })
+  }
+
+  const newHash = await hashPassword(newPassword)
+  // Only if the password is still the one we just verified: two simultaneous changes cannot overwrite each other silently.
+  const result = await pool.query('UPDATE users SET password_hash = $1 WHERE id = $2 AND password_hash = $3', [newHash, row.id, row.password_hash])
+  if (result.rowCount === 0) throw new ServiceError(AUTH_ERRORS.CONFLICT, 'Your password was changed from somewhere else. Please try again.')
+}
